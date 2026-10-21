@@ -1,0 +1,60 @@
+From: Simon Polack <spolack+git@mailbox.org>
+Subject: [PATCH] net: ethernet: cavium: octeon_pip: prefetch the shared info and the page struct a packet ahead
+
+The poll prefetches the next packet's work entry and its first data
+line. The skb build then writes the skb_shared_info at the end of the
+buffer and looks at the page struct, and the stack reads both back: the
+L1 is write-through without allocation on write, so the first read of a
+line written first misses. Prefetch both lines with the data, a packet
+ahead.
+
+Signed-off-by: Simon Polack <spolack+git@mailbox.org>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/net/ethernet/cavium/octeon/octeon_pip_rx.c
++++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_rx.c
+@@ -802,6 +802,23 @@
+ 	return n;
+ }
+ 
++/*
++ * The lines the stack touches first, a packet ahead: the packet data (the
++ * headers), the skb_shared_info the skb build writes and the stack reads
++ * back, and the page struct the build and the free look at. The L1 is
++ * write-through without allocation on write: a line written first and
++ * read then misses on the read unless it is in by then.
++ */
++static __always_inline void opip_rx_prefetch_packet(const struct opip_wqe *wqe)
++{
++	void *buffer = opip_virt(opip_buf_start(wqe->packet_ptr));
++
++	prefetch(opip_virt(opip_buf_addr(wqe->packet_ptr)));
++	prefetch(buffer + OPIP_RX_FRAG_SIZE -
++		 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)));
++	prefetch(virt_to_page(buffer));
++}
++
+ static __always_inline int __opip_poll(struct opip_group *group, int budget,
+ 				       const bool xdp_on)
+ {
+@@ -883,7 +900,7 @@
+ 		}
+ 
+ 		/* The packet data, the stack reads its headers first */
+-		prefetch(opip_virt(opip_buf_addr(wqe->packet_ptr)));
++		opip_rx_prefetch_packet(wqe);
+ 		rx_count++;
+ 
+ 		port = opip_rx_port(wqe, pknd);
+@@ -912,9 +929,9 @@
+ 		if (!(rx_count & (OPIP_TX_POLL_TICK - 1)))
+ 			opip_tx_poll_tick(&group->tx_poll);
+ 
+-		/* Its line is in by now: have the next packet's data follow */
++		/* Its line is in by now: have the next packet's lines follow */
+ 		if (next)
+-			prefetch(opip_virt(opip_buf_addr(next->packet_ptr)));
++			opip_rx_prefetch_packet(next);
+ 		wqe = next;
+ 	}
+ 	if (idle)
