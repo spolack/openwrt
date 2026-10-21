@@ -1,0 +1,265 @@
+From: Simon Polack <spolack+git@mailbox.org>
+Subject: [PATCH] net: udp: fraglist GSO: one walk over the segments, hardware checksum
+
+The fraglist GSO of a forwarded UDP flow walked the segments three times after skb_segment_list(): the UDP walk (addresses, ports, ttl, tos, with an incremental UDP and IP checksum update per segment), then inet_gso_segment()'s loop (id, tot_len, ip_send_check(), mac_len), which also read each segment's shared info for skb_is_gso() (a cache miss per segment on the EdgeRouter 4: 0.9 of the 7.1 L1 misses per packet on image P2). The 64 segments of a poll do not fit the L1 between the walks, and every store to a segment's header line in a later walk is another write-buffer entry.
+
+Let inet_gso_segment() grant the plain IPv4 case of its loop (no encapsulation, no UDP fragmentation, no fixed id) to the L4 fraglist segmenter via two bits in the GSO cb, and do that work in the UDP walk: ids, tot_len, the IP checksum (once, no incremental update first), mac_len, in the same pass as the UDP fields. The fraglist segments are never GSO themselves, so the shared info is not read. When the headers were mangled (NAT) and the device checksums UDP over IPv4 (NETIF_F_IP_CSUM or NETIF_F_HW_CSUM in the features given to the segmenter), leave the pseudo-header checksum in the segment and mark it CHECKSUM_PARTIAL instead of the incremental update: GRO only takes plain IPv4 headers (no options, not a fragment, verified checksum) into a list, so the segments meet the device's conditions the way a locally built UDP GSO packet does. The features were stripped for a parent that is not CHECKSUM_PARTIAL; the fraglist walk gets them for its IPv4 segments.
+
+On the EdgeRouter 4 (CN7030, octeon_pip, PKO checksum insertion): fw4 NAT flood1 spent 2.5 % in __udpv4_gso_segment_csum plus 1.3 % in inet_proto_csum_replace4, inet_gso_segment 3.3 % (120 cycles per packet) on P2; stack flood1 inet_gso_segment 4.2 %.
+
+Signed-off-by: Simon Polack <spolack+git@mailbox.org>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+--- a/include/net/gso.h
++++ b/include/net/gso.h
+@@ -19,6 +19,13 @@
+ 	int	encap_level;
+ 	__wsum	csum;
+ 	__u16	csum_start;
++	/*
++	 * inet_gso_segment() lets a fraglist segmenter fix the segments'
++	 * plain IPv4 headers (id, tot_len, check, mac_len) in its own walk
++	 * over them (l3_fixup_ok); the segmenter says it did (l3_fixed).
++	 */
++	__u8	l3_fixup_ok:1,
++		l3_fixed:1;
+ };
+ #define SKB_GSO_CB_OFFSET	32
+ #define SKB_GSO_CB(skb) ((struct skb_gso_cb *)((skb)->cb + SKB_GSO_CB_OFFSET))
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -212,6 +212,25 @@
+ 			     struct ip_frag_state *state);
+ 
+ void ip_send_check(struct iphdr *ip);
++
++/*
++ * The IPv4 header of a fraglist GSO segment after the forwarding and
++ * mangling of the first one: the id sequence, the segment's length and
++ * checksum, and the mac_len of the output's MAC header: what
++ * inet_gso_segment() does per segment in the plain case, for an L4
++ * fraglist segmenter that does it in its own walk over the segments
++ * (SKB_GSO_CB(segs)->l3_fixup_ok granted, ->l3_fixed told).
++ */
++static inline void inet_gso_fraglist_fix(struct sk_buff *seg,
++					 struct iphdr *iph, u16 id)
++{
++	iph->id = htons(id);
++	iph->tot_len = htons(seg->len - skb_network_offset(seg));
++	iph->check = 0;
++	iph->check = ip_fast_csum((unsigned char *)iph, iph->ihl);
++	skb_reset_mac_len(seg);
++}
++
+ int __ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb);
+ int ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb);
+ 
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -1396,6 +1396,14 @@
+ 	if (!skb->encapsulation || encap)
+ 		udpfrag = !!(skb_shinfo(skb)->gso_type & SKB_GSO_UDP);
+ 
++	/*
++	 * A fraglist segmenter walks the segments' headers anyway: it may
++	 * do the plain IPv4 case of the loop below in that walk (one pass
++	 * over the segments' header lines instead of two) and say so.
++	 */
++	SKB_GSO_CB(skb)->l3_fixup_ok = !encap && !udpfrag && !fixedid;
++	SKB_GSO_CB(skb)->l3_fixed = 0;
++
+ 	ops = rcu_dereference(inet_offloads[proto]);
+ 	if (likely(ops && ops->callbacks.gso_segment)) {
+ 		segs = ops->callbacks.gso_segment(skb, features);
+@@ -1406,6 +1414,9 @@
+ 	if (IS_ERR_OR_NULL(segs))
+ 		goto out;
+ 
++	if (SKB_GSO_CB(skb)->l3_fixed)
++		goto out;
++
+ 	gso_partial = !!(skb_shinfo(segs)->gso_type & SKB_GSO_PARTIAL);
+ 
+ 	skb = segs;
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@ -353,13 +353,11 @@
+ 				     __be16 *oldport, __be16 *newport)
+ {
+ 	struct udphdr *uh;
+-	struct iphdr *iph;
+ 
+ 	if (*oldip == *newip && *oldport == *newport)
+ 		return;
+ 
+ 	uh = udp_hdr(seg);
+-	iph = ip_hdr(seg);
+ 
+ 	if (uh->check) {
+ 		inet_proto_csum_replace4(&uh->check, seg, *oldip, *newip,
+@@ -370,50 +368,96 @@
+ 			uh->check = CSUM_MANGLED_0;
+ 	}
+ 	*oldport = *newport;
+-
+-	csum_replace4(&iph->check, *oldip, *newip);
+ 	*oldip = *newip;
+ }
+ 
+-static struct sk_buff *__udpv4_gso_segment_list_csum(struct sk_buff *segs)
++static struct sk_buff *__udpv4_gso_segment_list_csum(struct sk_buff *segs,
++						     netdev_features_t features)
+ {
+-	struct sk_buff *seg;
++	bool l3 = SKB_GSO_CB(segs)->l3_fixup_ok;
++	struct sk_buff *seg = segs;
+ 	struct udphdr *uh, *uh2;
+ 	struct iphdr *iph, *iph2;
++	bool offload, nat, mangled;
++	u16 id;
+ 
+-	seg = segs;
+ 	uh = udp_hdr(seg);
+ 	iph = ip_hdr(seg);
++	uh2 = udp_hdr(seg->next);
++	iph2 = ip_hdr(seg->next);
+ 
+-	if ((udp_hdr(seg)->dest == udp_hdr(seg->next)->dest) &&
+-	    (udp_hdr(seg)->source == udp_hdr(seg->next)->source) &&
+-	    (ip_hdr(seg)->daddr == ip_hdr(seg->next)->daddr) &&
+-	    (ip_hdr(seg)->saddr == ip_hdr(seg->next)->saddr) &&
+-	    (ip_hdr(seg)->ttl == ip_hdr(seg->next)->ttl) &&
+-	    (ip_hdr(seg)->tos == ip_hdr(seg->next)->tos))
++	/* Forwarding and mangling only touched the first segment's header */
++	nat = uh->dest != uh2->dest || uh->source != uh2->source ||
++	      iph->daddr != iph2->daddr || iph->saddr != iph2->saddr;
++	mangled = nat || iph->ttl != iph2->ttl || iph->tos != iph2->tos;
++	if (!mangled && !l3)
+ 		return segs;
+ 
++	/*
++	 * A device that checksums UDP over IPv4 computes the translated
++	 * segments' checksums from the pseudo-header the stack leaves in
++	 * the field: no incremental update per segment. GRO took only
++	 * plain IPv4 headers (no options, not a fragment) into the list,
++	 * the ones NETIF_F_IP_CSUM covers.
++	 */
++	offload = nat && uh->check &&
++		  (features & (NETIF_F_HW_CSUM | NETIF_F_IP_CSUM));
++	id = ntohs(iph->id);
++
++	if (l3) {
++		inet_gso_fraglist_fix(seg, iph, id);
++		SKB_GSO_CB(segs)->l3_fixed = 1;
++	}
++
+ 	while ((seg = seg->next)) {
+ 		uh2 = udp_hdr(seg);
+ 		iph2 = ip_hdr(seg);
++		id++;
+ 
+-		/* The next segment's headers and shared info while this one is done */
++		/*
++		 * The next segment's header line while this one is done,
++		 * and the skb lines of the one after it: every line read
++		 * here was prefetched an iteration ago
++		 */
+ 		if (seg->next) {
+-			prefetch(seg->next->data);
+-			prefetch(skb_shinfo(seg->next));
++			struct sk_buff *n1 = seg->next, *n2 = n1->next;
++
++			prefetch(n1->data);
++			if (n2) {
++				prefetch(n2);
++				prefetch(&n2->head);
++			}
+ 		}
+ 
+-		__udpv4_gso_segment_csum(seg,
+-					 &iph2->saddr, &iph->saddr,
+-					 &uh2->source, &uh->source);
+-		__udpv4_gso_segment_csum(seg,
+-					 &iph2->daddr, &iph->daddr,
+-					 &uh2->dest, &uh->dest);
+-		/* Forwarding and mangling only touched the first segment's
+-		 * header; inet_gso_segment() recomputes the IP checksum.
+-		 */
++		if (offload) {
++			iph2->saddr = iph->saddr;
++			iph2->daddr = iph->daddr;
++			uh2->source = uh->source;
++			uh2->dest = uh->dest;
++			if (uh2->check) {
++				uh2->check = ~udp_v4_check(ntohs(uh2->len),
++							   iph->saddr,
++							   iph->daddr, 0);
++				seg->ip_summed = CHECKSUM_PARTIAL;
++				seg->csum_start = (unsigned char *)uh2 -
++						  seg->head;
++				seg->csum_offset = offsetof(struct udphdr,
++							    check);
++			}
++		} else if (nat) {
++			__udpv4_gso_segment_csum(seg,
++						 &iph2->saddr, &iph->saddr,
++						 &uh2->source, &uh->source);
++			__udpv4_gso_segment_csum(seg,
++						 &iph2->daddr, &iph->daddr,
++						 &uh2->dest, &uh->dest);
++		}
++		/* The IP checksum is recomputed below or by inet_gso_segment() */
+ 		iph2->ttl = iph->ttl;
+ 		iph2->tos = iph->tos;
++
++		if (l3)
++			inet_gso_fraglist_fix(seg, iph2, id);
+ 	}
+ 
+ 	return segs;
+@@ -484,6 +528,7 @@
+ 
+ static struct sk_buff *__udp_gso_segment_list(struct sk_buff *skb,
+ 					      netdev_features_t features,
++					      netdev_features_t csum_features,
+ 					      bool is_ipv6)
+ {
+ 	unsigned int mss = skb_shinfo(skb)->gso_size;
+@@ -497,7 +542,7 @@
+ 	if (is_ipv6)
+ 		return __udpv6_gso_segment_list_csum(skb);
+ 	else
+-		return __udpv4_gso_segment_list_csum(skb);
++		return __udpv4_gso_segment_list_csum(skb, csum_features);
+ }
+ 
+ struct sk_buff *__udp_gso_segment(struct sk_buff *gso_skb,
+@@ -505,6 +550,7 @@
+ {
+ 	struct sock *sk = gso_skb->sk;
+ 	unsigned int sum_truesize = 0;
++	netdev_features_t csum_features;
+ 	struct sk_buff *segs, *seg;
+ 	struct udphdr *uh;
+ 	unsigned int mss;
+@@ -524,7 +570,10 @@
+ 
+ 	/* We don't know if egress device can segment and checksum the packet
+ 	 * when IPv6 extension headers are present. Fall back to software GSO.
++	 * The fraglist walk keeps the checksum offloads for its IPv4
++	 * segments, whose headers GRO vetted.
+ 	 */
++	csum_features = features & NETIF_F_CSUM_MASK;
+ 	if (gso_skb->ip_summed != CHECKSUM_PARTIAL)
+ 		features &= ~(NETIF_F_GSO_UDP_L4 | NETIF_F_CSUM_MASK);
+ 
+@@ -539,7 +588,8 @@
+ 		 /* Detect modified geometry and pass those to skb_segment. */
+ 		if ((skb_pagelen(gso_skb) - sizeof(*uh) == skb_shinfo(gso_skb)->gso_size) &&
+ 		    !(skb_shinfo(gso_skb)->gso_type & SKB_GSO_DODGY))
+-			return __udp_gso_segment_list(gso_skb, features, is_ipv6);
++			return __udp_gso_segment_list(gso_skb, features,
++						      csum_features, is_ipv6);
+ 
+ 		ret = __skb_linearize(gso_skb);
+ 		if (ret)
