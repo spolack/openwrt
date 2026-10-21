@@ -9,6 +9,7 @@ BOARD:=octeon
 BOARDNAME:=Cavium Networks Octeon
 FEATURES:=squashfs ramdisk pci usb
 CPU_TYPE:=octeonplus
+SUBTARGETS:=generic octeon3
 
 KERNEL_PATCHVER:=6.18
 
