@@ -16,7 +16,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  #include <linux/skbuff.h>
  #include <net/gro.h>
  #include <net/gso.h>
-@@ -36,29 +37,28 @@
+@@ -36,29 +37,28 @@ static void __tcpv4_gso_segment_csum(str
  				     __be16 *oldport, __be16 newport)
  {
  	struct tcphdr *th;
@@ -49,7 +49,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  
  	seg = segs;
  	th = tcp_hdr(seg);
-@@ -66,26 +66,54 @@
+@@ -66,26 +66,54 @@ static struct sk_buff *__tcpv4_gso_segme
  	th2 = tcp_hdr(seg->next);
  	iph2 = ip_hdr(seg->next);
  

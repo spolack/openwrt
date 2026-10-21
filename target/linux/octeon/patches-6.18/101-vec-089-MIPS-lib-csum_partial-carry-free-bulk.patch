@@ -55,7 +55,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  #else
  #define CSUM_BIGCHUNK(src, offset, sum, _t0, _t1, _t2, _t3)	\
  	CSUM_BIGCHUNK1(src, offset, sum, _t0, _t1, _t2, _t3);	\
-@@ -107,6 +143,10 @@
+@@ -107,6 +143,10 @@ LEAF(csum_partial)
  EXPORT_SYMBOL(csum_partial)
  	move	sum, zero
  	move	t7, zero
@@ -66,7 +66,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  
  	sltiu	t8, a1, 0x8
  	bnez	t8, .Lsmall_csumcpy		/* < 8 bytes to copy */
-@@ -194,10 +234,22 @@
+@@ -194,10 +234,22 @@ EXPORT_SYMBOL(csum_partial)
  	/* Four 128-byte chunks ahead: the sum is the first touch of the data */
  	kernel_pref(0, 0x200(src))
  #endif
@@ -89,7 +89,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  	LONG_SUBU	t8, t8, 0x01
  	.set	reorder				/* DADDI_WAR */
  	PTR_ADDU	src, src, 0x80
-@@ -209,8 +261,16 @@
+@@ -209,8 +261,16 @@ EXPORT_SYMBOL(csum_partial)
  	 andi	t2, a1, 0x20
  
  .Lmove_64bytes:
@@ -106,7 +106,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  	PTR_ADDU	src, src, 0x40
  
  1:
-@@ -218,11 +278,24 @@
+@@ -218,11 +278,24 @@ EXPORT_SYMBOL(csum_partial)
  	 andi	t8, a1, 0x1c
  
  .Lmove_32bytes:

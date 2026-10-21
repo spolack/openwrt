@@ -18,7 +18,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 ---
 --- a/drivers/net/ethernet/cavium/octeon/octeon_pip.h
 +++ b/drivers/net/ethernet/cavium/octeon/octeon_pip.h
-@@ -203,6 +203,13 @@
+@@ -203,6 +203,13 @@ struct opip_txq {
  	unsigned long no_wqe;
  	unsigned long no_chunk;
  	unsigned long stopped;
@@ -34,7 +34,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  	struct sk_buff *netpoll_skbs;
 --- a/drivers/net/ethernet/cavium/octeon/octeon_pip_ethtool.c
 +++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_ethtool.c
-@@ -24,6 +24,8 @@
+@@ -24,6 +24,8 @@ static const char opip_stat_names[][ETH_
  	"tx_linearized",
  	"tx_no_wqe",
  	"tx_no_chunk",
@@ -43,7 +43,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  	/*
  	 * Error events, not frames: the times the periodic worker found the
  	 * bit set, see opip_poll_errors()
-@@ -77,6 +79,7 @@
+@@ -77,6 +79,7 @@ static void opip_get_ethtool_stats(struc
  				   struct ethtool_stats *stats, u64 *data)
  {
  	u64 linearized = 0, no_wqe = 0, no_chunk = 0;
@@ -51,7 +51,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  	struct opip_port *p = opip_port(dev);
  	unsigned int qid;
  	int i = 0;
-@@ -87,10 +90,14 @@
+@@ -87,10 +90,14 @@ static void opip_get_ethtool_stats(struc
  		linearized += READ_ONCE(q->linearized);
  		no_wqe += READ_ONCE(q->no_wqe);
  		no_chunk += READ_ONCE(q->no_chunk);
@@ -99,7 +99,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  
  static struct sk_buff *opip_tx_entry_skb(unsigned long entry)
  {
-@@ -124,6 +139,17 @@
+@@ -124,6 +139,17 @@ static u64 **opip_tx_skb_list(struct sk_
  	return (u64 **)skb->cb;
  }
  
@@ -117,7 +117,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  /* The largest IP header offset IPOFFP1 (offset + 1, 7 bits) can name */
  #define OPIP_TX_MAX_IPOFF	(FIELD_MAX(OPIP_PKO_CMD_IPOFFP1) - 1)
  
-@@ -254,6 +280,45 @@
+@@ -254,6 +280,45 @@ static __always_inline void opip_tx_pref
  	}
  }
  
@@ -163,7 +163,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  static unsigned int opip_tx_complete(struct net_device *dev, unsigned int qid,
  				     struct opip_txq *q, int budget)
  {
-@@ -302,6 +367,12 @@
+@@ -302,6 +367,12 @@ static unsigned int opip_tx_complete(str
  			opip_tx_prefetch_free(q->ring[head &
  						      (OPIP_TXQ_RING - 1)]);
  		if (skb) {
@@ -176,7 +176,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  			if (entry & OPIP_TX_GATHER)
  				opip_fpa_free_nosync(*opip_tx_skb_list(skb),
  						     OPIP_POOL_WQE, 0);
-@@ -582,6 +653,30 @@
+@@ -582,6 +653,30 @@ static int opip_hw_csum_off(struct sk_bu
   * Return: @features less what vlan_features_check() takes away, and less
   * the checksum offloads if the PKO cannot insert @skb's checksum
   */
@@ -207,7 +207,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  netdev_features_t opip_features_check(struct sk_buff *skb,
  				      struct net_device *dev,
  				      netdev_features_t features)
-@@ -589,6 +684,19 @@
+@@ -589,6 +684,19 @@ netdev_features_t opip_features_check(st
  	features = vlan_features_check(skb, features);
  	if (skb->ip_summed == CHECKSUM_PARTIAL && opip_hw_csum_off(skb) < 0)
  		features &= ~NETIF_F_CSUM_MASK;
@@ -227,7 +227,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  	return features;
  }
  
-@@ -678,10 +786,14 @@
+@@ -678,10 +786,14 @@ static unsigned int opip_tx_map_skb(cons
   */
  static bool opip_tx_map_frags(struct sk_buff *skb, u64 *cmd, u64 *buf)
  {
@@ -243,7 +243,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  	if (unlikely(!list))
  		return false;
  	n = opip_tx_map_skb(skb, list, 0);
-@@ -713,7 +825,8 @@
+@@ -713,7 +825,8 @@ static bool opip_tx_write(struct net_dev
  	if (WARN_ON_ONCE(q->tail - READ_ONCE(q->head) >= OPIP_TXQ_RING))
  		return false;
  
@@ -253,7 +253,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  		if (unlikely(!opip_tx_map_frags(skb, &cmd, &buf))) {
  			WRITE_ONCE(q->no_wqe, q->no_wqe + 1);
  			return false;
-@@ -763,6 +876,359 @@
+@@ -763,6 +876,359 @@ static bool opip_tx_poll_mark(struct opi
  	return true;
  }
  
@@ -613,7 +613,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  /**
   * opip_xmit - transmit a packet
   * @skb: Packet to send
-@@ -795,6 +1261,16 @@
+@@ -795,6 +1261,16 @@ netdev_tx_t opip_xmit(struct sk_buff *sk
  	poll = IS_ENABLED(CONFIG_NETPOLL) && (in_hardirq() || in_nmi()) ?
  	       NULL : __this_cpu_read(opip_tx_poll_cur);
  
@@ -632,7 +632,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  		     opip_tx_count_segs(skb) > OPIP_TX_MAX_SEGS)) {
 --- a/drivers/net/ethernet/cavium/octeon/octeon_pip_main.c
 +++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_main.c
-@@ -1175,7 +1175,14 @@
+@@ -1175,7 +1175,14 @@ static struct net_device *opip_alloc_por
  	 */
  	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
  	dev->hw_features = NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_IP_CSUM |

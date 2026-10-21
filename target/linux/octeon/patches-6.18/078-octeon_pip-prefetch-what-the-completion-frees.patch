@@ -13,7 +13,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
 --- a/drivers/net/ethernet/cavium/octeon/octeon_pip_tx.c
 +++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_tx.c
-@@ -231,6 +231,29 @@
+@@ -231,6 +231,29 @@ static void opip_tx_doorbell(struct opip
   *
   * Return: the number of packets completed
   */
@@ -43,7 +43,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  static unsigned int opip_tx_complete(struct net_device *dev, unsigned int qid,
  				     struct opip_txq *q, int budget)
  {
-@@ -256,6 +279,10 @@
+@@ -256,6 +279,10 @@ static unsigned int opip_tx_complete(str
  
  	xdp_frame_bulk_init(&bq);
  	rcu_read_lock();
@@ -54,7 +54,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  	while (n--) {
  		unsigned long entry = q->ring[head++ & (OPIP_TXQ_RING - 1)];
  		struct sk_buff *skb = opip_tx_entry_skb(entry);
-@@ -263,10 +290,17 @@
+@@ -263,10 +290,17 @@ static unsigned int opip_tx_complete(str
  
  		xdpf = opip_tx_entry_xdpf(entry);
  

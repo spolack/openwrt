@@ -12,7 +12,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
 --- a/net/core/skbuff.c
 +++ b/net/core/skbuff.c
-@@ -4669,6 +4669,16 @@
+@@ -4669,6 +4669,16 @@ struct sk_buff *skb_segment_list(struct
  		nskb = list_skb;
  		list_skb = list_skb->next;
  
@@ -39,7 +39,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  #include <net/gro.h>
  #include <net/gso.h>
  #include <net/udp.h>
-@@ -396,6 +397,12 @@
+@@ -396,6 +397,12 @@ static struct sk_buff *__udpv4_gso_segme
  		uh2 = udp_hdr(seg);
  		iph2 = ip_hdr(seg);
  
@@ -62,7 +62,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  #include <net/sock.h>
  #include <net/raw.h>
  #include <net/icmp.h>
-@@ -1409,6 +1410,11 @@
+@@ -1409,6 +1410,11 @@ struct sk_buff *inet_gso_segment(struct
  
  	skb = segs;
  	do {
@@ -84,7 +84,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  #include <linux/kthread.h>
  #include <linux/bpf.h>
  #include <linux/bpf_trace.h>
-@@ -3893,6 +3894,11 @@
+@@ -3893,6 +3894,11 @@ struct sk_buff *dev_hard_start_xmit(stru
  	while (skb) {
  		struct sk_buff *next = skb->next;
  

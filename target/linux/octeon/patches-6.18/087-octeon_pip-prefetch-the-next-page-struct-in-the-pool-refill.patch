@@ -8,7 +8,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
 --- a/drivers/net/ethernet/cavium/octeon/octeon_pip_fpa.c
 +++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_fpa.c
-@@ -147,11 +147,15 @@
+@@ -147,11 +147,15 @@ unsigned int opip_fpa_fill_packet_pool(s
  		}
  		/* The batch's writes out before the IPD may fill the pages */
  		wmb();

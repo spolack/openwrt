@@ -10,7 +10,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 ---
 --- a/drivers/net/ethernet/cavium/octeon/octeon_pip_hw.h
 +++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_hw.h
-@@ -271,6 +271,8 @@
+@@ -271,6 +271,8 @@ struct opip_wqe {
  
  /* word0 on the chips with port kinds (CN68XX) */
  #define OPIP_WQE0_PKND		GENMASK_ULL(5, 0)
@@ -32,7 +32,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  #include <linux/kernel.h>
  #include <linux/net.h>
  #include <linux/netdevice.h>
-@@ -529,6 +532,93 @@
+@@ -529,6 +532,93 @@ static struct sk_buff *opip_rx_copy_skb(
  	return skb;
  }
  
@@ -126,7 +126,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  /* Always inline: with two callers gcc calls it out of line, per packet */
  static __always_inline void opip_rx_deliver(struct opip_group *group,
  					    struct net_device *dev,
-@@ -562,10 +652,17 @@
+@@ -562,10 +652,17 @@ static __always_inline void opip_rx_deli
  	if (unlikely((wqe->word2 & (OPIP_WQE2_NOT_IP | OPIP_WQE2_IP_EXC |
  				    OPIP_WQE2_IS_FRAG | OPIP_WQE2_L4_ERROR)) ||
  		     !(wqe->word2 & OPIP_WQE2_TCP_OR_UDP) || !csum_valid ||

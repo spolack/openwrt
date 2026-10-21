@@ -8,7 +8,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
 --- a/drivers/net/ethernet/cavium/octeon/octeon_pip_rx.c
 +++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_rx.c
-@@ -807,11 +807,15 @@
+@@ -807,11 +807,15 @@ static unsigned int opip_rx_refill(struc
   * write-through without allocation on write: a line written first and
   * read then misses on the read unless it is in by then.
   */
@@ -25,7 +25,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  	prefetch(buffer + OPIP_RX_FRAG_SIZE -
  		 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)));
  	prefetch(virt_to_page(buffer));
-@@ -898,7 +902,7 @@
+@@ -898,7 +902,7 @@ static __always_inline int __opip_poll(s
  		}
  
  		/* The packet data, the stack reads its headers first */
@@ -34,7 +34,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  		rx_count++;
  
  		port = opip_rx_port(wqe, pknd);
-@@ -929,7 +933,7 @@
+@@ -929,7 +933,7 @@ static __always_inline int __opip_poll(s
  
  		/* Its line is in by now: have the next packet's lines follow */
  		if (next)

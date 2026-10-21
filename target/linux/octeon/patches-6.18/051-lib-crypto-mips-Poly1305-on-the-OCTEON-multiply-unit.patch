@@ -37,10 +37,9 @@ state-level comparison against the 130-bit reference pass.
 
 Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 ---
-diff -Nur a/lib/crypto/Makefile b/lib/crypto/Makefile
 --- a/lib/crypto/Makefile
 +++ b/lib/crypto/Makefile
-@@ -146,6 +146,10 @@
+@@ -146,6 +146,10 @@ endif
  
  ifeq ($(CONFIG_MIPS),y)
  libpoly1305-y += mips/poly1305-core.o
@@ -51,7 +50,6 @@ diff -Nur a/lib/crypto/Makefile b/lib/crypto/Makefile
  poly1305-perlasm-flavour-$(CONFIG_32BIT) := o32
  poly1305-perlasm-flavour-$(CONFIG_64BIT) := 64
  quiet_cmd_perlasm_poly1305 = PERLASM $@
-diff -Nur a/lib/crypto/mips/poly1305.h b/lib/crypto/mips/poly1305.h
 --- a/lib/crypto/mips/poly1305.h
 +++ b/lib/crypto/mips/poly1305.h
 @@ -7,8 +7,20 @@
@@ -77,8 +75,7 @@ diff -Nur a/lib/crypto/mips/poly1305.h b/lib/crypto/mips/poly1305.h
 +	else
 +		poly1305_blocks_mips(state, src, len, hibit);
 +}
-diff -Nur a/lib/crypto/mips/poly1305-octeon.S b/lib/crypto/mips/poly1305-octeon.S
---- a/lib/crypto/mips/poly1305-octeon.S
+--- /dev/null
 +++ b/lib/crypto/mips/poly1305-octeon.S
 @@ -0,0 +1,230 @@
 +/* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */

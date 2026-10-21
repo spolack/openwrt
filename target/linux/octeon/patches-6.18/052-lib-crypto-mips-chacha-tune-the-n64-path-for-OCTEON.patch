@@ -50,7 +50,7 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
  #else
  #define STACK_SIZE		32
  #define NROUNDS_OFF		(STACK_SIZE + 16)
-@@ -235,6 +238,1014 @@
+@@ -235,6 +238,1014 @@ CONCAT3(.Lchacha_mips_xor_aligned_, PLUS
  	jr	T0
  #endif
  
@@ -1065,7 +1065,7 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
  .text
  .set	reorder
  .set	noat
-@@ -457,6 +1468,7 @@
+@@ -457,6 +1468,7 @@ chacha_crypt_arch:
  	FOR_EACH_WORD(JMPTBL_UNALIGNED)
  .end chacha_crypt_arch
  .set at

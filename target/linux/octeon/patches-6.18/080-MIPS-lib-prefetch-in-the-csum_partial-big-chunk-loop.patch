@@ -13,7 +13,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
 --- a/arch/mips/lib/csum_partial.S
 +++ b/arch/mips/lib/csum_partial.S
-@@ -190,6 +190,10 @@
+@@ -190,6 +190,10 @@ EXPORT_SYMBOL(csum_partial)
  	 andi	t2, a1, 0x40
  
  .Lmove_128bytes:

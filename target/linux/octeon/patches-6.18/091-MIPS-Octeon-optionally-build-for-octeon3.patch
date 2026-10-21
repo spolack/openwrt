@@ -16,7 +16,7 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 
 --- a/arch/mips/cavium-octeon/Kconfig
 +++ b/arch/mips/cavium-octeon/Kconfig
-@@ -11,6 +11,15 @@
+@@ -11,6 +11,15 @@ config CAVIUM_CN63XXP1
  	  non-CN63XXP1 hardware, so it is recommended to select "n"
  	  unless it is known the workarounds are needed.
  
@@ -34,7 +34,7 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
  	range 0 54
 --- a/arch/mips/Makefile
 +++ b/arch/mips/Makefile
-@@ -172,7 +172,13 @@
+@@ -182,7 +182,13 @@ cflags-$(CONFIG_CPU_SB1)	+= $(call cc-op
  cflags-$(CONFIG_CPU_SB1)	+= $(call cc-option,-mno-mips3d)
  cflags-$(CONFIG_CPU_R10000)	+= $(call cc-option,-march=r10000,-march=mips4) \
  			-Wa,--trap

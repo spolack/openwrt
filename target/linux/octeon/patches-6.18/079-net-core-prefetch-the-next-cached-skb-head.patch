@@ -11,7 +11,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
 --- a/net/core/skbuff.c
 +++ b/net/core/skbuff.c
-@@ -309,6 +309,9 @@
+@@ -309,6 +309,9 @@ static struct sk_buff *napi_skb_cache_ge
  	}
  
  	skb = nc->skb_cache[--nc->skb_count];
