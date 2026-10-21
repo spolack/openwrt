@@ -1,0 +1,119 @@
+From: Simon Polack <spolack+git@mailbox.org>
+Subject: [PATCH] net: tcp: fraglist GSO: the IPv4 headers in the TCP walk
+
+The TCP twin of the UDP change: when inet_gso_segment() grants the plain IPv4 case, __tcpv4_gso_segment_list_csum() fixes the segments' IPv4 headers (id, tot_len, checksum, mac_len) in its walk, and the incremental IP checksum update per mangled segment goes (the checksum is recomputed once). inet_gso_segment() then skips its loop and the read of each segment's shared info. Every forwarded TCP flow with fraglist GRO (NETIF_F_GRO_FRAGLIST) takes this path, the GRE and WireGuard TCP tests included.
+
+Signed-off-by: Simon Polack <spolack+git@mailbox.org>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+--- a/net/ipv4/tcp_offload.c
++++ b/net/ipv4/tcp_offload.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <linux/indirect_call_wrapper.h>
++#include <linux/prefetch.h>
+ #include <linux/skbuff.h>
+ #include <net/gro.h>
+ #include <net/gso.h>
+@@ -36,29 +37,28 @@
+ 				     __be16 *oldport, __be16 newport)
+ {
+ 	struct tcphdr *th;
+-	struct iphdr *iph;
+ 
+ 	if (*oldip == newip && *oldport == newport)
+ 		return;
+ 
+ 	th = tcp_hdr(seg);
+-	iph = ip_hdr(seg);
+ 
+ 	inet_proto_csum_replace4(&th->check, seg, *oldip, newip, true);
+ 	inet_proto_csum_replace2(&th->check, seg, *oldport, newport, false);
+ 	*oldport = newport;
+-
+-	csum_replace4(&iph->check, *oldip, newip);
+ 	*oldip = newip;
+ }
+ 
+ static struct sk_buff *__tcpv4_gso_segment_list_csum(struct sk_buff *segs)
+ {
++	bool l3 = SKB_GSO_CB(segs)->l3_fixup_ok;
+ 	const struct tcphdr *th;
+ 	const struct iphdr *iph;
+ 	struct sk_buff *seg;
+ 	struct tcphdr *th2;
+ 	struct iphdr *iph2;
++	bool mangled;
++	u16 id;
+ 
+ 	seg = segs;
+ 	th = tcp_hdr(seg);
+@@ -66,26 +66,54 @@
+ 	th2 = tcp_hdr(seg->next);
+ 	iph2 = ip_hdr(seg->next);
+ 
+-	if (!(*(const u32 *)&th->source ^ *(const u32 *)&th2->source) &&
+-	    iph->daddr == iph2->daddr && iph->saddr == iph2->saddr &&
+-	    iph->ttl == iph2->ttl && iph->tos == iph2->tos)
++	mangled = (*(const u32 *)&th->source ^ *(const u32 *)&th2->source) ||
++		  iph->daddr != iph2->daddr || iph->saddr != iph2->saddr ||
++		  iph->ttl != iph2->ttl || iph->tos != iph2->tos;
++	if (!mangled && !l3)
+ 		return segs;
+ 
++	/* The IPv4 headers in the same walk, see inet_gso_segment() */
++	id = ntohs(iph->id);
++	if (l3) {
++		inet_gso_fraglist_fix(seg, ip_hdr(seg), id);
++		SKB_GSO_CB(segs)->l3_fixed = 1;
++	}
++
+ 	while ((seg = seg->next)) {
+ 		th2 = tcp_hdr(seg);
+ 		iph2 = ip_hdr(seg);
++		id++;
+ 
+-		__tcpv4_gso_segment_csum(seg,
+-					 &iph2->saddr, iph->saddr,
+-					 &th2->source, th->source);
+-		__tcpv4_gso_segment_csum(seg,
+-					 &iph2->daddr, iph->daddr,
+-					 &th2->dest, th->dest);
+-		/* Forwarding and mangling only touched the first segment's
+-		 * header; inet_gso_segment() recomputes the IP checksum.
++		/*
++		 * The next segment's header line while this one is done,
++		 * and the skb lines of the one after it
+ 		 */
+-		iph2->ttl = iph->ttl;
+-		iph2->tos = iph->tos;
++		if (seg->next) {
++			struct sk_buff *n1 = seg->next, *n2 = n1->next;
++
++			prefetch(n1->data);
++			if (n2) {
++				prefetch(n2);
++				prefetch(&n2->head);
++			}
++		}
++
++		if (mangled) {
++			__tcpv4_gso_segment_csum(seg,
++						 &iph2->saddr, iph->saddr,
++						 &th2->source, th->source);
++			__tcpv4_gso_segment_csum(seg,
++						 &iph2->daddr, iph->daddr,
++						 &th2->dest, th->dest);
++			/* Forwarding and mangling only touched the first
++			 * segment's header; the IP checksum is recomputed
++			 * below or by inet_gso_segment().
++			 */
++			iph2->ttl = iph->ttl;
++			iph2->tos = iph->tos;
++		}
++		if (l3)
++			inet_gso_fraglist_fix(seg, iph2, id);
+ 	}
+ 
+ 	return segs;
