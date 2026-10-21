@@ -1,0 +1,23 @@
+From: Simon Polack <spolack+git@mailbox.org>
+Subject: [PATCH] net: core: prefetch the next cached skb head
+
+napi_build_skb() clears the skb it takes from the per-CPU cache and
+reads it back at once (pfmemalloc, the shared info setup): on a core
+whose L1 does not allocate on write the first read misses. Prefetch the
+next cached head when one is taken; it is in by the next build.
+
+Signed-off-by: Simon Polack <spolack+git@mailbox.org>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -309,6 +309,9 @@
+ 	}
+ 
+ 	skb = nc->skb_cache[--nc->skb_count];
++	/* The next one's first line, for the next build's clear and reads */
++	if (nc->skb_count)
++		prefetch(nc->skb_cache[nc->skb_count - 1]);
+ 	local_unlock_nested_bh(&napi_alloc_cache.bh_lock);
+ 	kasan_mempool_unpoison_object(skb, kmem_cache_size(net_hotdata.skbuff_cache));
+ 
