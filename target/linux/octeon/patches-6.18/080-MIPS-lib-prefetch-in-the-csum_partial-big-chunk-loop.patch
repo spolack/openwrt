@@ -1,0 +1,26 @@
+From: Simon Polack <spolack+git@mailbox.org>
+Subject: [PATCH] MIPS: lib: prefetch in the csum_partial big-chunk loop
+
+csum_partial() is the first touch of a received payload on a software
+checksum validation (a GRE tunnel's inner TCP on the EdgeRouter 4: 11 %
+of the decap core's L1 misses, 9 % of its cycles) and every 128-byte
+line misses. Prefetch four chunks ahead in the 128-byte loop (two were
+measured first: the loop iterates in ~25 cycles, the data comes from L2
+or DRAM), as memcpy.S does; nothing changes for the short paths.
+
+Signed-off-by: Simon Polack <spolack+git@mailbox.org>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/arch/mips/lib/csum_partial.S
++++ b/arch/mips/lib/csum_partial.S
+@@ -190,6 +190,10 @@
+ 	 andi	t2, a1, 0x40
+ 
+ .Lmove_128bytes:
++#ifdef CONFIG_CPU_HAS_PREFETCH
++	/* Four 128-byte chunks ahead: the sum is the first touch of the data */
++	kernel_pref(0, 0x200(src))
++#endif
+ 	CSUM_BIGCHUNK(src, 0x00, sum, t0, t1, t3, t4)
+ 	CSUM_BIGCHUNK(src, 0x20, sum, t0, t1, t3, t4)
+ 	CSUM_BIGCHUNK(src, 0x40, sum, t0, t1, t3, t4)
