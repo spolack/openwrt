@@ -1,0 +1,650 @@
+From: Simon Polack <spolack+git@mailbox.org>
+Subject: [PATCH] octeon_pip: transmit fraglist GSO packets as they are (NETIF_F_GSO_FRAGLIST)
+
+A forwarded flow arrives as a GRO list: the head carries what the stack changed (the output MAC header, ttl, tos, a NAT's addresses and ports) and the other packets as received, each with its own IP and UDP/TCP header in its own buffer. Without NETIF_F_GSO_FRAGLIST the stack re-segments the list in validate_xmit_skb(): skb_segment_list() gives every segment a copy of the head's skb state (a conntrack reference, the header offsets) and of the MAC header, the L4 walk fixes addresses, ports, ttl, tos and the checksums, inet_gso_segment() ids, lengths and IP checksums, dev_hard_start_xmit() hands each segment to opip_xmit(), the completion frees each after dropping its state: five passes over the segments' lines, 22 % of the forwarding core on the EdgeRouter 4 with a 64 byte UDP flood (630 cycles per packet on image P2), plus 8 % for the per-segment conntrack reference in the NAT case.
+
+Advertise NETIF_F_GSO_FRAGLIST (with NETIF_F_GSO_UDP_L4, NETIF_F_TSO and NETIF_F_TSO_ECN: net_gso_ok() wants a feature for every gso_type bit of a list; opip_features_check() takes all of them away from every GSO packet that is not an admitted list, so a local socket's TSO or UDP GSO is segmented by the stack as before) and send the list in one pass: per segment the head's MAC header (from a local copy) into the room before its IP header, the IP and L4 fix-up the stack's walks do (identical values: the head's addresses, ports, ttl and tos, the head's id plus the segment's index, the segment's own length, the IP checksum recomputed), a PKO command for the buffer from the MAC header to the end, with the PKO's L4 checksum insertion (IPOFFP1, the pseudo-header checksum left in the field) when the addresses or ports changed and the segment has a checksum, unchanged headers keep their verified ones; the head's own packet first with its UDP length, IP length and checksum fixed to its own size. The ring slot of the last command holds the head (OPIP_TX_LIST): the PKO sends in order, so its completion means all segments are out; it frees the head and the segments one by one to the NAPI cache and the page pool's direct path, as single packets are freed, and reports the list's bytes to BQL (kept in the head's cb). The segments never get a copy of the head's state: no conntrack reference, no dst, no header copy per segment.
+
+What takes the old path: everything opip_tx_list_ok() does not admit (IPv6, encapsulated, fixed-id TCP, DODGY, a MAC header longer than two VLAN tags, a CN3XXX half duplex port with runt padding) is segmented by the stack as before; a list with a segment that has page fragments or no room for the MAC header, or longer than the queue's wake threshold, is segmented in the driver with skb_gso_segment() and sent segment by segment; a list that does not fit the queue's free slots stops the queue and returns NETDEV_TX_BUSY (the wake threshold is the longest list, so a woken queue has room). The XDP, netpoll and pktgen paths are untouched; a purge frees a list's head with its list. GRO only lists IPv4 headers without options that are no fragments with a verified checksum (inet_gro_receive), so ihl is 5 for every segment, and the segments' header offsets are GRO's, which the stack's skb_segment_list() relies on the same way.
+
+Correctness is end to end on the bench: the NAT UDP flood (checksums at the host), the stack flood (ids, lengths), the TCP tests (the TCP fraglist path), the VLAN case (an 18 byte MAC header), WireGuard/GRE (the lists arrive at the tunnel device: software path, unchanged).
+
+v4: the list head's entry no longer goes through the gather mapping of opip_tx_write() (v3 rewrote the last segment's command into a gather of the whole list, or left it unwritten when the WQE pool allocation failed, and stored the list pointer over the BQL bytes in the head's cb); a list that does not fit the queue announces the batch's earlier commands (doorbell, poll list or timer) before it stops the queue and returns NETDEV_TX_BUSY (v3 stopped the queue with those commands unannounced: nothing rang them later, the queue never woke: "N packets in flight, the PKO holds 0 command words"); a head whose own packet is not exactly one segment (headlen - MAC - headers != gso_size, or page fragments) goes through the stack's segmentation.
+
+v5 (review): a cloned head or a shared segment goes through the stack's segmentation (the headers are written in place and the segments freed as the list's own; a tap on the ingress port, ipmr or a bridge flood clone the head and copy-on-write shares the segments); the gather list of a fragmented skb is bounded to its buffer (WARN_ONCE, dropped); ethtool -S tx_list_geometry and tx_list_shared count the lists handed to the stack from the list path.
+
+Signed-off-by: Simon Polack <spolack+git@mailbox.org>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+--- a/drivers/net/ethernet/cavium/octeon/octeon_pip.h
++++ b/drivers/net/ethernet/cavium/octeon/octeon_pip.h
+@@ -203,6 +203,13 @@
+ 	unsigned long no_wqe;
+ 	unsigned long no_chunk;
+ 	unsigned long stopped;
++	/*
++	 * Fraglist GSO packets handed to the stack's segmentation from
++	 * opip_xmit_list(): a head whose own packet is not one segment, a
++	 * cloned head or shared segments, see there
++	 */
++	unsigned long list_geometry;
++	unsigned long list_shared;
+ 	unsigned long ring[OPIP_TXQ_RING];
+ 	/* Page pool skbs netpoll completed with irqs off, for the NAPI */
+ 	struct sk_buff *netpoll_skbs;
+--- a/drivers/net/ethernet/cavium/octeon/octeon_pip_ethtool.c
++++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_ethtool.c
+@@ -24,6 +24,8 @@
+ 	"tx_linearized",
+ 	"tx_no_wqe",
+ 	"tx_no_chunk",
++	"tx_list_geometry",
++	"tx_list_shared",
+ 	/*
+ 	 * Error events, not frames: the times the periodic worker found the
+ 	 * bit set, see opip_poll_errors()
+@@ -77,6 +79,7 @@
+ 				   struct ethtool_stats *stats, u64 *data)
+ {
+ 	u64 linearized = 0, no_wqe = 0, no_chunk = 0;
++	u64 list_geometry = 0, list_shared = 0;
+ 	struct opip_port *p = opip_port(dev);
+ 	unsigned int qid;
+ 	int i = 0;
+@@ -87,10 +90,14 @@
+ 		linearized += READ_ONCE(q->linearized);
+ 		no_wqe += READ_ONCE(q->no_wqe);
+ 		no_chunk += READ_ONCE(q->no_chunk);
++		list_geometry += READ_ONCE(q->list_geometry);
++		list_shared += READ_ONCE(q->list_shared);
+ 	}
+ 	data[i++] = linearized;
+ 	data[i++] = no_wqe;
+ 	data[i++] = no_chunk;
++	data[i++] = list_geometry;
++	data[i++] = list_shared;
+ 	data[i++] = READ_ONCE(p->tx_pko_nxa);
+ 	data[i++] = READ_ONCE(p->pcs_an_error);
+ 	data[i++] = READ_ONCE(p->pcs_tx_fifo_error);
+--- a/drivers/net/ethernet/cavium/octeon/octeon_pip_tx.c
++++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_tx.c
+@@ -58,6 +58,8 @@
+ #include <linux/rcupdate.h>
+ #include <linux/tcp.h>
+ #include <linux/udp.h>
++#include <linux/unaligned.h>
++#include <net/gso.h>
+ #include <net/ip.h>
+ #include <net/netdev_queues.h>
+ 
+@@ -93,7 +95,20 @@
+  */
+ #define OPIP_TX_XDP		1UL
+ #define OPIP_TX_GATHER		2UL
+-#define OPIP_TX_FLAGS		(OPIP_TX_XDP | OPIP_TX_GATHER)
++/*
++ * The head of a fraglist GSO packet, in the ring slot of its last
++ * segment's command: the completion frees the head and its list, and
++ * tells BQL the bytes of all segments (kept in the head's cb). The slots
++ * of the other segments hold 0. See opip_xmit_list().
++ */
++#define OPIP_TX_LIST		4UL
++#define OPIP_TX_FLAGS		(OPIP_TX_XDP | OPIP_TX_GATHER | OPIP_TX_LIST)
++
++/* The longest MAC header a fraglist segment is given: two VLAN tags */
++#define OPIP_TX_LIST_MAC	24
++/* The features a fraglist GSO packet needs (a bit per gso_type bit) */
++#define OPIP_TX_LIST_FEATURES	(NETIF_F_GSO_FRAGLIST | NETIF_F_GSO_UDP_L4 | \
++				 NETIF_F_TSO | NETIF_F_TSO_ECN)
+ 
+ static struct sk_buff *opip_tx_entry_skb(unsigned long entry)
+ {
+@@ -124,6 +139,17 @@
+ 	return (u64 **)skb->cb;
+ }
+ 
++/* The wire bytes of all segments of a fraglist GSO packet (OPIP_TX_LIST) */
++static unsigned int *opip_tx_list_bytes(struct sk_buff *skb)
++{
++	return (unsigned int *)skb->cb;
++}
++
++static netdev_tx_t opip_xmit_list(struct sk_buff *skb, struct net_device *dev,
++				  struct opip_port *p, struct opip_txq *q,
++				  struct netdev_queue *txq, unsigned int qid,
++				  struct opip_tx_poll *poll);
++
+ /* The largest IP header offset IPOFFP1 (offset + 1, 7 bits) can name */
+ #define OPIP_TX_MAX_IPOFF	(FIELD_MAX(OPIP_PKO_CMD_IPOFFP1) - 1)
+ 
+@@ -254,6 +280,45 @@
+ 	}
+ }
+ 
++/*
++ * The head of a sent fraglist GSO packet and its segments, each to the
++ * NAPI cache (and its buffer to the page pool's direct path) as a single
++ * packet's skb is: the segments were received a poll or two ago and
++ * never had a copy of the head's state (no dst, no conntrack reference).
++ * The lines of the segment after the next, and what the next one's free
++ * reads, are prefetched a round ahead.
++ */
++static void opip_tx_free_list(struct sk_buff *head, int budget)
++{
++	struct sk_buff *seg = skb_shinfo(head)->frag_list;
++
++	skb_shinfo(head)->frag_list = NULL;
++	head->len -= head->data_len;
++	head->data_len = 0;
++	if (seg) {
++		prefetch(seg);
++		prefetch(&seg->head);
++	}
++	napi_consume_skb(head, budget);
++	while (seg) {
++		struct sk_buff *n1 = seg->next;
++
++		if (n1) {
++			struct sk_buff *n2 = n1->next;
++
++			if (n2) {
++				prefetch(n2);
++				prefetch(&n2->head);
++			}
++			prefetch(skb_shinfo(n1));
++			prefetch(virt_to_page(n1->head));
++		}
++		seg->next = NULL;
++		napi_consume_skb(seg, budget);
++		seg = n1;
++	}
++}
++
+ static unsigned int opip_tx_complete(struct net_device *dev, unsigned int qid,
+ 				     struct opip_txq *q, int budget)
+ {
+@@ -302,6 +367,12 @@
+ 			opip_tx_prefetch_free(q->ring[head &
+ 						      (OPIP_TXQ_RING - 1)]);
+ 		if (skb) {
++			if (unlikely(entry & OPIP_TX_LIST)) {
++				bytes += *opip_tx_list_bytes(skb);
++				skbs++;
++				opip_tx_free_list(skb, budget);
++				continue;
++			}
+ 			if (entry & OPIP_TX_GATHER)
+ 				opip_fpa_free_nosync(*opip_tx_skb_list(skb),
+ 						     OPIP_POOL_WQE, 0);
+@@ -582,6 +653,30 @@
+  * Return: @features less what vlan_features_check() takes away, and less
+  * the checksum offloads if the PKO cannot insert @skb's checksum
+  */
++/*
++ * The fraglist GSO packets opip_xmit_list() sends: a GRO list of plain
++ * IPv4 UDP or TCP packets (no fixed ids, no encapsulation), behind a MAC
++ * header the segments have room for. The stack segments the others.
++ * The shared info was read by gso_features_check() just before.
++ */
++static bool opip_tx_list_ok(const struct sk_buff *skb)
++{
++	unsigned int type = skb_shinfo(skb)->gso_type & ~SKB_GSO_TCP_ECN;
++
++	if (type != (SKB_GSO_FRAGLIST | SKB_GSO_UDP_L4) &&
++	    type != (SKB_GSO_FRAGLIST | SKB_GSO_TCPV4))
++		return false;
++	if (skb->encapsulation || vlan_get_protocol(skb) != htons(ETH_P_IP))
++		return false;
++	if (skb_network_offset(skb) < ETH_HLEN ||
++	    skb_network_offset(skb) > OPIP_TX_LIST_MAC)
++		return false;
++	/* The runt padding of a CN3XXX half duplex port works per skb */
++	if (static_branch_unlikely(&opip_gmx401))
++		return false;
++	return true;
++}
++
+ netdev_features_t opip_features_check(struct sk_buff *skb,
+ 				      struct net_device *dev,
+ 				      netdev_features_t features)
+@@ -589,6 +684,19 @@
+ 	features = vlan_features_check(skb, features);
+ 	if (skb->ip_summed == CHECKSUM_PARTIAL && opip_hw_csum_off(skb) < 0)
+ 		features &= ~NETIF_F_CSUM_MASK;
++	/*
++	 * net_gso_ok() wants a feature for every gso_type bit of a list
++	 * (FRAGLIST and UDP_L4, or TCPV4 with or without ECN): the port
++	 * advertises them for the lists it sends, and takes them away from
++	 * every other GSO packet (a local socket's TSO or UDP GSO: the PKO
++	 * segments nothing, the stack does as it did without the bits) and
++	 * from the lists it does not send. IPv6 lists lack TSO6 and are
++	 * stripped by net_gso_ok() or by opip_tx_list_ok() (UDP).
++	 */
++	if (skb_is_gso(skb) &&
++	    (!(skb_shinfo(skb)->gso_type & SKB_GSO_FRAGLIST) ||
++	     !opip_tx_list_ok(skb)))
++		features &= ~OPIP_TX_LIST_FEATURES;
+ 	return features;
+ }
+ 
+@@ -678,10 +786,14 @@
+  */
+ static bool opip_tx_map_frags(struct sk_buff *skb, u64 *cmd, u64 *buf)
+ {
+-	u64 *list = opip_fpa_alloc(OPIP_POOL_WQE);
++	u64 *list;
+ 	struct sk_buff *frag;
+ 	unsigned int n;
+ 
++	/* The callers linearized what does not fit; the list is one buffer */
++	if (WARN_ON_ONCE(opip_tx_count_segs(skb) > OPIP_TX_MAX_SEGS))
++		return false;
++	list = opip_fpa_alloc(OPIP_POOL_WQE);
+ 	if (unlikely(!list))
+ 		return false;
+ 	n = opip_tx_map_skb(skb, list, 0);
+@@ -713,7 +825,8 @@
+ 	if (WARN_ON_ONCE(q->tail - READ_ONCE(q->head) >= OPIP_TXQ_RING))
+ 		return false;
+ 
+-	if (skb && skb_is_nonlinear(skb)) {
++	/* A fraglist head (OPIP_TX_LIST) comes with its last segment's command */
++	if (skb && !(entry & OPIP_TX_LIST) && skb_is_nonlinear(skb)) {
+ 		if (unlikely(!opip_tx_map_frags(skb, &cmd, &buf))) {
+ 			WRITE_ONCE(q->no_wqe, q->no_wqe + 1);
+ 			return false;
+@@ -763,6 +876,359 @@
+ 	return true;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* Fraglist GSO: the segments of a GRO list as packets of their own */
++
++/*
++ * A forwarded flow arrives as a GRO list: the first packet (the head)
++ * carries the state the stack changed (the output MAC header, the
++ * decremented ttl, a new tos, the addresses and ports of a NAT) and the
++ * list of the other packets as received, each with its own IP and UDP or
++ * TCP header in its own buffer. Without NETIF_F_GSO_FRAGLIST the stack
++ * re-segments the list in validate_xmit_skb(): skb_segment_list() gives
++ * every segment a copy of the head's skb state (__copy_skb_header: a
++ * conntrack reference, the dst, the header offsets) and of the MAC
++ * header, the L4 walk fixes the addresses, ports, ttl and tos and the
++ * checksums, inet_gso_segment() the ids (the head's plus the segment's
++ * index), lengths and IP checksums, dev_hard_start_xmit() hands every
++ * segment to opip_xmit(), and the completion frees every segment after
++ * dropping its state again: five passes over the segments' lines, which
++ * do not fit the L1 between passes. This is one pass: per segment the
++ * MAC header (from a local copy of the head's) into the room before its
++ * IP header, the same IP and L4 fix-up the stack's walks do (identical
++ * values, ids included), a PKO command for the buffer from the MAC header
++ * to the end, with the PKO's L4 checksum insertion when the addresses or
++ * ports changed (the pseudo-header checksum left in the field, as
++ * 088's hardware path does; unchanged headers keep their verified
++ * checksums); the head's own packet first, its UDP length and IP length
++ * and checksum fixed to its own size. The ring slot of the last command
++ * holds the head: the PKO sends in order, so when it completes all
++ * segments are out, and the completion frees the list (opip_tx_free_list).
++ *
++ * The segments' network and transport header offsets are the receive
++ * path's and GRO's (the stack's skb_segment_list() relies on them the
++ * same way); GRO only lists IPv4 headers without options that are not
++ * fragments with a verified checksum (inet_gro_receive), so the ihl is 5.
++ * What opip_tx_list_ok() did not admit goes through the stack's
++ * segmentation; a list a segment of which has page fragments or no room
++ * for the MAC header, or longer than the wake threshold of the queue,
++ * is segmented here with skb_gso_segment() and sent segment by segment.
++ */
++
++struct opip_tx_list {
++	u64 mac[OPIP_TX_LIST_MAC / 8];
++	unsigned int mac_len;
++	__be32 saddr;
++	__be32 daddr;
++	__be16 source;
++	__be16 dest;
++	u8 ttl;
++	u8 tos;
++	/* The addresses or ports changed: the PKO computes the L4 checksum */
++	bool nat;
++	bool tcp;
++};
++
++/* The head's MAC header into the room before a segment's IP header */
++static __always_inline void opip_tx_list_mac(u8 *dst, const u64 *mac,
++					     unsigned int len)
++{
++	const u8 *src = (const u8 *)mac;
++
++	while (len >= 8) {
++		put_unaligned(*(const u64 *)src, (u64 *)dst);
++		src += 8;
++		dst += 8;
++		len -= 8;
++	}
++	if (len >= 4) {
++		put_unaligned(*(const u32 *)src, (u32 *)dst);
++		src += 4;
++		dst += 4;
++		len -= 4;
++	}
++	if (len >= 2)
++		put_unaligned(*(const u16 *)src, (u16 *)dst);
++}
++
++/*
++ * The IP and L4 header of a segment after the head's: what the stack's
++ * fraglist walks do (udp_offload.c, tcp_offload.c, inet_gso_segment()).
++ * Returns the segment's bytes on the wire; *@csum tells whether the PKO
++ * inserts the L4 checksum.
++ */
++static __always_inline unsigned int opip_tx_list_fix(struct sk_buff *seg,
++						     const struct opip_tx_list *l,
++						     u16 id, bool *csum)
++{
++	struct iphdr *iph = ip_hdr(seg);
++	unsigned int l3len = seg->len + (seg->data - (u8 *)iph);
++	void *l4 = iph + 1;
++
++	opip_tx_list_mac((u8 *)iph - l->mac_len, l->mac, l->mac_len);
++	iph->saddr = l->saddr;
++	iph->daddr = l->daddr;
++	iph->ttl = l->ttl;
++	iph->tos = l->tos;
++	iph->id = htons(id);
++	iph->tot_len = htons(l3len);
++	iph->check = 0;
++	iph->check = ip_fast_csum((unsigned char *)iph, 5);
++
++	*csum = false;
++	if (l->tcp) {
++		struct tcphdr *th = l4;
++
++		th->source = l->source;
++		th->dest = l->dest;
++		if (l->nat) {
++			th->check = ~csum_tcpudp_magic(l->saddr, l->daddr,
++						       l3len - sizeof(*iph),
++						       IPPROTO_TCP, 0);
++			*csum = true;
++		}
++	} else {
++		struct udphdr *uh = l4;
++
++		uh->source = l->source;
++		uh->dest = l->dest;
++		if (l->nat && uh->check) {
++			uh->check = ~csum_tcpudp_magic(l->saddr, l->daddr,
++						       l3len - sizeof(*iph),
++						       IPPROTO_UDP, 0);
++			*csum = true;
++		}
++	}
++	return l3len + l->mac_len;
++}
++
++/* The stack's segmentation for a list this path does not send */
++static noinline netdev_tx_t opip_xmit_list_sw(struct sk_buff *skb,
++					      struct net_device *dev)
++{
++	struct sk_buff *segs, *seg, *next;
++
++	segs = skb_gso_segment(skb, dev->features & ~NETIF_F_GSO_FRAGLIST);
++	if (IS_ERR_OR_NULL(segs)) {
++		opip_tx_drop(dev, skb);
++		return NETDEV_TX_OK;
++	}
++	consume_skb(skb);
++	skb_list_walk_safe(segs, seg, next) {
++		skb_mark_not_on_list(seg);
++		opip_xmit(seg, dev);
++	}
++	return NETDEV_TX_OK;
++}
++
++static netdev_tx_t opip_xmit_list(struct sk_buff *skb, struct net_device *dev,
++				  struct opip_port *p, struct opip_txq *q,
++				  struct netdev_queue *txq, unsigned int qid,
++				  struct opip_tx_poll *poll)
++{
++	unsigned int nhoff = skb_network_offset(skb);
++	struct sk_buff *seg, *first;
++	struct iphdr *iph, *iph2;
++	unsigned int n, bytes, hlen;
++	struct opip_tx_list l;
++	u64 cmd, buf;
++	u16 id;
++
++	/*
++	 * The segments: linear, with room for the MAC header; their count
++	 * (the shared info's gso_segs is GRO's count, the list is what is
++	 * sent) within what a woken queue has room for
++	 */
++	/*
++	 * The head: linear but for the list, its own packet exactly one
++	 * segment (the test __udp_gso_segment() makes before it takes the
++	 * list path; a head whose geometry was changed goes through the
++	 * stack's segmentation, which linearizes it)
++	 */
++	/*
++	 * A cloned head (a packet tap on the ingress port, a multicast
++	 * route, a bridge flood) or a shared segment (the head was cloned
++	 * and copied on write): the headers here are written in place,
++	 * the segments are freed as the list's own; the stack's
++	 * segmentation unclones and clones as needed
++	 */
++	if (unlikely(skb_cloned(skb))) {
++		WRITE_ONCE(q->list_shared, q->list_shared + 1);
++		return opip_xmit_list_sw(skb, dev);
++	}
++	if (unlikely(!skb_has_frag_list(skb) || nhoff > OPIP_TX_LIST_MAC ||
++		     skb_shinfo(skb)->nr_frags ||
++		     skb_headlen(skb) < nhoff + sizeof(struct iphdr) +
++					sizeof(struct udphdr)))
++		goto geometry;
++	iph = ip_hdr(skb);
++	if (iph->protocol == IPPROTO_TCP) {
++		const struct tcphdr *th = (const struct tcphdr *)(iph + 1);
++
++		hlen = sizeof(*iph) + th->doff * 4;
++	} else {
++		hlen = sizeof(*iph) + sizeof(struct udphdr);
++	}
++	if (unlikely(skb_headlen(skb) - nhoff - hlen !=
++		     skb_shinfo(skb)->gso_size))
++		goto geometry;
++	n = 1;
++	skb_walk_frags(skb, seg) {
++		if (unlikely(skb_shared(seg))) {
++			WRITE_ONCE(q->list_shared, q->list_shared + 1);
++			return opip_xmit_list_sw(skb, dev);
++		}
++		if (unlikely(seg->data_len ||
++			     skb_network_header(seg) - seg->head < nhoff) ||
++		    unlikely(++n > OPIP_TX_WAKE_THRESH))
++			goto geometry;
++	}
++
++	if (q->written >= OPIP_TX_COMPLETE_BATCH && !netpoll_tx_running(dev)) {
++		if (poll)
++			opip_tx_complete(dev, qid, q, poll->budget);
++		else
++			opip_tx_kick(q);
++	}
++	/*
++	 * Room for the whole list, or the stack tries again when woken.
++	 * The commands of the batch's earlier packets are announced now:
++	 * the queue stops, the batch ends here and nothing else would ring
++	 * them (their completion is what wakes the queue), and the timer
++	 * must watch them as it does for any last packet.
++	 */
++	if (unlikely(opip_txq_free_slots(q) < n)) {
++		netif_tx_stop_queue(txq);
++		WRITE_ONCE(q->stopped, q->stopped + 1);
++		opip_tx_doorbell(p, q);
++		if (!poll || !opip_tx_poll_mark(poll, q, dev, qid))
++			opip_tx_arm(q);
++		return NETDEV_TX_BUSY;
++	}
++
++	/* The template: the head's headers; the first segment tells NAT */
++	first = skb_shinfo(skb)->frag_list;
++	iph2 = ip_hdr(first);
++	l.mac_len = nhoff;
++	memcpy(l.mac, skb->data, nhoff);
++	l.saddr = iph->saddr;
++	l.daddr = iph->daddr;
++	l.ttl = iph->ttl;
++	l.tos = iph->tos;
++	l.tcp = iph->protocol == IPPROTO_TCP;
++	/* Behind the IP headers (ihl 5, see above), whatever the offsets say */
++	if (l.tcp) {
++		const struct tcphdr *th = (const struct tcphdr *)(iph + 1);
++
++		l.source = th->source;
++		l.dest = th->dest;
++		l.nat = iph->saddr != iph2->saddr ||
++			iph->daddr != iph2->daddr ||
++			*(const u32 *)&th->source !=
++			*(const u32 *)&((const struct tcphdr *)(iph2 + 1))->source;
++	} else {
++		struct udphdr *uh = (struct udphdr *)(iph + 1);
++
++		l.source = uh->source;
++		l.dest = uh->dest;
++		l.nat = iph->saddr != iph2->saddr ||
++			iph->daddr != iph2->daddr ||
++			*(const u32 *)&uh->source !=
++			*(const u32 *)&((const struct udphdr *)(iph2 + 1))->source;
++		/* The head's UDP length is the list's: its own */
++		uh->len = htons(skb_headlen(skb) - nhoff - sizeof(*iph));
++	}
++	id = ntohs(iph->id);
++
++	/*
++	 * The head's own packet: the buffer from its MAC header, its linear
++	 * bytes (the list's are in data_len), its own IP length and checksum
++	 */
++	bytes = skb_headlen(skb);
++	iph->tot_len = htons(bytes - nhoff);
++	iph->check = 0;
++	iph->check = ip_fast_csum((unsigned char *)iph, 5);
++	cmd = opip_pko_cmd(q, bytes, false);
++	buf = opip_pko_buf(skb->data, bytes);
++	if (unlikely(!opip_tx_write(dev, q, qid, 0, bytes, cmd, buf))) {
++		opip_tx_drop(dev, skb);
++		goto out;
++	}
++
++	/*
++	 * The segments: the one after the next gets its skb lines, the
++	 * next one's header line is prefetched for writing
++	 */
++	seg = first;
++	if (seg) {
++		prefetch(seg);
++		prefetch(&seg->head);
++	}
++	while (seg) {
++		struct sk_buff *n1 = seg->next;
++		unsigned int len;
++		bool csum;
++
++		if (n1) {
++			struct sk_buff *n2 = n1->next;
++
++			if (n2) {
++				prefetch(n2);
++				prefetch(&n2->head);
++			}
++			prefetchw(skb_network_header(n1) - nhoff);
++		}
++		len = opip_tx_list_fix(seg, &l, ++id, &csum);
++		cmd = opip_pko_cmd(q, len, false);
++		if (csum)
++			cmd |= FIELD_PREP(OPIP_PKO_CMD_IPOFFP1, nhoff + 1);
++		buf = opip_pko_buf(skb_network_header(seg) - nhoff, len);
++		bytes += len;
++		if (!n1)
++			*opip_tx_list_bytes(skb) = bytes;
++		if (unlikely(!opip_tx_write(dev, q, qid,
++					    n1 ? 0 : (unsigned long)skb |
++						      OPIP_TX_LIST,
++					    len, cmd, buf))) {
++			/*
++			 * No command chunk for the rest: the packets before
++			 * are in flight, the head goes into the slot of the
++			 * last one written and is freed after it; the rest
++			 * of the list is lost with it
++			 */
++			unsigned long *slot;
++
++			bytes -= len;
++			*opip_tx_list_bytes(skb) = bytes;
++			slot = &q->ring[(q->tail - 1) & (OPIP_TXQ_RING - 1)];
++			*slot = (unsigned long)skb | OPIP_TX_LIST;
++			WRITE_ONCE(q->skbs, q->skbs + 1);
++			dev_core_stats_tx_dropped_inc(dev);
++			break;
++		}
++		seg = n1;
++	}
++	opip_tx_maybe_stop(txq, q);
++
++out:
++	if (poll && opip_tx_poll_mark(poll, q, dev, qid)) {
++		if (!netdev_xmit_more() ||
++		    q->doorbell >= OPIP_TX_POLL_DOORBELL ||
++		    netif_xmit_stopped(txq))
++			opip_tx_doorbell(p, q);
++		return NETDEV_TX_OK;
++	}
++	if (!netdev_xmit_more() || netif_xmit_stopped(txq)) {
++		opip_tx_doorbell(p, q);
++		opip_tx_arm(q);
++	}
++	return NETDEV_TX_OK;
++
++geometry:
++	WRITE_ONCE(q->list_geometry, q->list_geometry + 1);
++	return opip_xmit_list_sw(skb, dev);
++}
++
+ /**
+  * opip_xmit - transmit a packet
+  * @skb: Packet to send
+@@ -795,6 +1261,16 @@
+ 	poll = IS_ENABLED(CONFIG_NETPOLL) && (in_hardirq() || in_nmi()) ?
+ 	       NULL : __this_cpu_read(opip_tx_poll_cur);
+ 
++	/*
++	 * A fraglist GSO packet (NETIF_F_GSO_FRAGLIST): its segments as
++	 * packets of their own, see opip_xmit_list(). data_len is in the
++	 * skb's first line; the shared info is read only for a packet that
++	 * has one.
++	 */
++	if (unlikely(skb->data_len) && skb_is_gso(skb) &&
++	    (skb_shinfo(skb)->gso_type & SKB_GSO_FRAGLIST))
++		return opip_xmit_list(skb, dev, p, q, txq, qid, poll);
++
+ 	/* The gather list must fit its buffer */
+ 	if (unlikely(skb_is_nonlinear(skb) &&
+ 		     opip_tx_count_segs(skb) > OPIP_TX_MAX_SEGS)) {
+--- a/drivers/net/ethernet/cavium/octeon/octeon_pip_main.c
++++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_main.c
+@@ -1175,7 +1175,14 @@
+ 	 */
+ 	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
+ 	dev->hw_features = NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_IP_CSUM |
+-			   NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM | NETIF_F_RXHASH;
++			   NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM | NETIF_F_RXHASH |
++			   /*
++			    * GRO lists as they are, see opip_xmit_list(): the
++			    * list's gso_type bits need all four, every other
++			    * GSO packet loses them in opip_features_check()
++			    */
++			   NETIF_F_GSO_FRAGLIST | NETIF_F_GSO_UDP_L4 |
++			   NETIF_F_TSO | NETIF_F_TSO_ECN;
+ 	dev->features |= dev->hw_features;
+ 	dev->vlan_features |= dev->hw_features;
+ 	/* The receive untag of a single 802.1Q tag, see opip_rx_vlan_untag() */
