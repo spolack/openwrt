@@ -1,0 +1,77 @@
+From: Simon Polack <spolack+git@mailbox.org>
+Subject: [PATCH] net: ethernet: cavium: octeon_pip: prefetch what the completion frees
+
+The completion prefetched the first line of the next completed skb. The
+free reads its second line (head, truesize), the shared info (dataref,
+the page pool flag) and the page struct (pp magic, refcount): all gone
+from the L1 since the packet was received. Prefetch the two skb lines
+two entries ahead and, from them, the shared info and the page struct
+one entry ahead.
+
+Signed-off-by: Simon Polack <spolack+git@mailbox.org>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/net/ethernet/cavium/octeon/octeon_pip_tx.c
++++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_tx.c
+@@ -231,6 +231,29 @@
+  *
+  * Return: the number of packets completed
+  */
++/* The two lines of a completed entry's skb (or XDP frame) */
++static __always_inline void opip_tx_prefetch_entry(unsigned long entry)
++{
++	void *p = (void *)(entry & ~OPIP_TX_FLAGS);
++
++	prefetch(p);
++	prefetch(p + 128);
++}
++
++/*
++ * What the free of an skb reads beyond its own lines: the shared info and
++ * the page struct of its head. Its lines are in: prefetched a round ago.
++ */
++static __always_inline void opip_tx_prefetch_free(unsigned long entry)
++{
++	struct sk_buff *skb = opip_tx_entry_skb(entry);
++
++	if (skb) {
++		prefetch(skb_shinfo(skb));
++		prefetch(virt_to_page(skb->head));
++	}
++}
++
+ static unsigned int opip_tx_complete(struct net_device *dev, unsigned int qid,
+ 				     struct opip_txq *q, int budget)
+ {
+@@ -256,6 +279,10 @@
+ 
+ 	xdp_frame_bulk_init(&bq);
+ 	rcu_read_lock();
++	/* The first two entries: no round before them */
++	opip_tx_prefetch_entry(q->ring[head & (OPIP_TXQ_RING - 1)]);
++	if (n > 1)
++		opip_tx_prefetch_entry(q->ring[(head + 1) & (OPIP_TXQ_RING - 1)]);
+ 	while (n--) {
+ 		unsigned long entry = q->ring[head++ & (OPIP_TXQ_RING - 1)];
+ 		struct sk_buff *skb = opip_tx_entry_skb(entry);
+@@ -263,10 +290,17 @@
+ 
+ 		xdpf = opip_tx_entry_xdpf(entry);
+ 
+-		/* The next one was sent long ago, its lines have gone */
++		/*
++		 * The next ones were sent long ago, their lines have gone:
++		 * the one after the next gets its own lines, the next what
++		 * its free reads
++		 */
++		if (n > 1)
++			opip_tx_prefetch_entry(q->ring[(head + 1) &
++						       (OPIP_TXQ_RING - 1)]);
+ 		if (n)
+-			prefetch((void *)(q->ring[head & (OPIP_TXQ_RING - 1)] &
+-					  ~OPIP_TX_FLAGS));
++			opip_tx_prefetch_free(q->ring[head &
++						      (OPIP_TXQ_RING - 1)]);
+ 		if (skb) {
+ 			if (entry & OPIP_TX_GATHER)
+ 				opip_fpa_free_nosync(*opip_tx_skb_list(skb),
