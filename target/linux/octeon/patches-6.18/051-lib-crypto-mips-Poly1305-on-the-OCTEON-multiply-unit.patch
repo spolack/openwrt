@@ -1,0 +1,313 @@
+From: Simon Polack <spolack+git@mailbox.org>
+Subject: [PATCH] lib/crypto: mips/poly1305 - add an OCTEON block function on the multiply unit
+
+The cnMIPS cores of the Cavium OCTEON SoCs carry a multiply-accumulate
+unit next to the ALU: mtm0-2 load a 192-bit multiplier register, mtp0-2
+an accumulator, and v3mulu rd,rs,rt returns one 64-bit word of
+M * rs + P + rt while the rest stays in the accumulator, shifted down by
+a word.  Feeding the three radix-2^64 words of h and draining once yields
+the 256-bit r*h in four instructions, with no mfhi/mflo traffic and no
+partial products on the ALU.
+
+Add a Poly1305 block function on that unit for 64-bit OCTEON kernels and
+select it at compile time (CONFIG_CPU_CAVIUM_OCTEON kernels run only on
+OCTEON, and every generation has the unit); the generic MIPS64
+Cryptogams code stays the block function for other CPUs, under the name
+poly1305_blocks_mips.  The multiplier state (MPL/P) is part of pt_regs
+on OCTEON and saved on every exception entry and context switch, so the
+function needs no explicit save/restore and runs in any context.
+
+The unit is not pipelined (6 cycles per v3mulu, about 4 for a drain) and
+the core issues in order, so the loop is rotated so that the reduction
+mod 2^130-5, the carries and the next message block all sit in the
+shadow of the multiplies; an 8-byte aligned source gets a loop with
+plain loads, since ldl/ldr pairs cost about 2.5 cycles per block.
+
+Measured on a CN7030 (EdgeRouter 4, 1 GHz), one core, blocks only
+(cycles per byte; the Cryptogams MIPS64 code for comparison):
+
+                   64 B    256 B   1024 B   1420 B   1420 B unaligned
+  Cryptogams       4.08    3.78    3.66     3.65     3.66
+  OCTEON unit      2.09    1.64    1.51     1.50     1.65
+
+A full 1420-byte MAC including init and emit takes 2455 cycles instead
+of 5527.  RFC 8439 vector, random messages of every length up to 600
+bytes (whole and chunked), 64 KiB random messages, carry stress and
+state-level comparison against the 130-bit reference pass.
+
+Signed-off-by: Simon Polack <spolack+git@mailbox.org>
+---
+diff -Nur a/lib/crypto/Makefile b/lib/crypto/Makefile
+--- a/lib/crypto/Makefile
++++ b/lib/crypto/Makefile
+@@ -146,6 +146,10 @@
+ 
+ ifeq ($(CONFIG_MIPS),y)
+ libpoly1305-y += mips/poly1305-core.o
++AFLAGS_mips/poly1305-core.o += -Dpoly1305_blocks=poly1305_blocks_mips
++ifeq ($(CONFIG_CPU_CAVIUM_OCTEON)$(CONFIG_64BIT),yy)
++libpoly1305-y += mips/poly1305-octeon.o
++endif
+ poly1305-perlasm-flavour-$(CONFIG_32BIT) := o32
+ poly1305-perlasm-flavour-$(CONFIG_64BIT) := 64
+ quiet_cmd_perlasm_poly1305 = PERLASM $@
+diff -Nur a/lib/crypto/mips/poly1305.h b/lib/crypto/mips/poly1305.h
+--- a/lib/crypto/mips/poly1305.h
++++ b/lib/crypto/mips/poly1305.h
+@@ -7,8 +7,20 @@
+ 
+ asmlinkage void poly1305_block_init(struct poly1305_block_state *state,
+ 				    const u8 raw_key[POLY1305_BLOCK_SIZE]);
+-asmlinkage void poly1305_blocks(struct poly1305_block_state *state,
+-				const u8 *src, u32 len, u32 hibit);
++asmlinkage void poly1305_blocks_mips(struct poly1305_block_state *state,
++				     const u8 *src, u32 len, u32 hibit);
++asmlinkage void poly1305_blocks_octeon(struct poly1305_block_state *state,
++				       const u8 *src, u32 len, u32 hibit);
+ asmlinkage void poly1305_emit(const struct poly1305_state *state,
+ 			      u8 digest[POLY1305_DIGEST_SIZE],
+ 			      const u32 nonce[4]);
++
++static inline void poly1305_blocks(struct poly1305_block_state *state,
++				   const u8 *src, u32 len, u32 hibit)
++{
++	/* OCTEON cores have a multiply-accumulate unit (mtm/mtp/v3mulu). */
++	if (IS_ENABLED(CONFIG_CPU_CAVIUM_OCTEON) && IS_ENABLED(CONFIG_64BIT))
++		poly1305_blocks_octeon(state, src, len, hibit);
++	else
++		poly1305_blocks_mips(state, src, len, hibit);
++}
+diff -Nur a/lib/crypto/mips/poly1305-octeon.S b/lib/crypto/mips/poly1305-octeon.S
+--- a/lib/crypto/mips/poly1305-octeon.S
++++ b/lib/crypto/mips/poly1305-octeon.S
+@@ -0,0 +1,230 @@
++/* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
++/*
++ * Poly1305 block function for Cavium OCTEON (cnMIPS) using the core's
++ * multiply-accumulate unit (mtm0-2/mtp0-2/v3mulu).
++ *
++ * Copyright (C) 2026 Simon Polack <spolack+git@mailbox.org>
++ *
++ * v3mulu rd,rs,rt computes {P,rd} = M*rs + P + rt with a 192-bit multiplier
++ * register M (wider on OCTEON III; the single-register mtm0-2 forms zero the
++ * upper words) and an accumulator P that is shifted down by one word per
++ * instruction: feeding the radix-2^64 words of h in order yields the words
++ * of r*h in order.  h < 2^131 and the clamped r < 2^124 keep the product
++ * below 2^255, so four instructions (the last one with rs = 0, a drain)
++ * produce d0..d3 and leave P = 0 for the next block.  The unit is not
++ * pipelined: a v3mulu occupies it for 6 cycles (a drain for about 4) and the
++ * in-order core issues nothing past a v3mulu that waits for the unit, so
++ * every other instruction has to sit where it overlaps a multiply.
++ *
++ * Reduction mod 2^130-5 of d = d0 + d1*2^64 + d2*2^128 + d3*2^192: with
++ * L = d mod 2^130 and H = d >> 130, h' = L + 5*H, where 4*H is the word pair
++ * (d2 & ~3, d3) and H is ((d2 >> 2) | (d3 << 62), d3 >> 2):
++ *	h0 = d0 + m0 + (d2 & ~3) + ((d2 >> 2) | (d3 << 62))
++ *	h1 = d1 + m1 + d3 + (d3 >> 2) + carries(h0)
++ *	h2 = (d2 & 3) + hibit + carries(h1)		(<= 6)
++ * The next block's message m is added in the same sums.  d3 + (d3 >> 2) +
++ * carries(h0) fits in one word (d3 < 2^63), so h1 takes a single addend e
++ * with one carry.  The loop is rotated: between d3 and the next block's first
++ * v3mulu only the merge of the two shifted words and their add into h0
++ * remain; the carry of that add, e and the h1/h2 completion are done while
++ * that multiply is in flight, and the message add of the following block
++ * while the drain is.
++ *
++ * State layout (struct poly1305_block_state, as poly1305-mips.pl):
++ *	0..23	h0, h1, h2 (radix 2^64, h2 < 8)
++ *	24	r0
++ *	32	r1
++ *	40	s1 (unused here)
++ *
++ * The multiplier state (MPL0-5/P0-5) is part of pt_regs on OCTEON: it is
++ * saved on every exception entry and restored on return, so this function
++ * may run in any context without an explicit save/restore.
++ */
++
++#define ctx	$4
++#define src	$5
++#define last	$6
++#define hibit	$7
++#define d0	$8
++#define d1	$9
++#define d2	$10
++#define d3	$11
++#define h0	$12
++#define h1	$13
++#define h2	$14
++#define m0	$15
++#define m1	$24
++#define ta	$25
++#define tb	$2
++#define tc	$3
++#define td	$1
++
++#if defined(__MIPSEB__) && !defined(MIPSEB)
++# define MIPSEB
++#endif
++
++#ifdef MIPSEB
++# define MSB 0
++# define LSB 7
++#else
++# define MSB 7
++# define LSB 0
++#endif
++
++/*
++ * Load the two message words.  ldl/ldr pairs cost about 2.5 cycles per block
++ * more than plain loads here, so an 8-byte aligned source gets its own loop.
++ */
++.macro	LOAD_BLOCK aligned
++.if \aligned
++	ld	m0, 0(src)
++	ld	m1, 8(src)
++.else
++	ldl	m0, 0+MSB(src)
++	ldl	m1, 8+MSB(src)
++	ldr	m0, 0+LSB(src)
++	ldr	m1, 8+LSB(src)
++.endif
++.endm
++
++/* byte-swap the two message words on big-endian hosts */
++.macro	SWAP_BLOCK
++#ifdef MIPSEB
++	dsbh	m0, m0
++	dsbh	m1, m1
++	dshd	m0, m0
++	dshd	m1, m1
++#endif
++.endm
++
++/*
++ * Pending work of the previous reduction, done after its last add into h0:
++ * tc = carry of that add, td = e = d3 + (d3 >> 2) + all carries out of h0.
++ * (d2 holds the addend of that last add, d3 and ta the previous d3 and the
++ * carry count; all three are 0 before the first block.)
++ */
++.macro	PENDING_E
++	sltu	tc, h0, d2
++	dsrl	td, d3, 2
++	daddu	td, td, d3		# e = d3 + (d3 >> 2)
++	daddu	ta, ta, tc
++	daddu	td, td, ta		#   + carries(h0)
++.endm
++
++/* one block per round: multiply h, reduce, add the next message block */
++.macro	BLOCK_LOOP aligned
++	.align	4
++1:
++	v3mulu	d0, h0, $0		# word 0 of r*h
++	PENDING_E
++	LOAD_BLOCK \aligned			# next message block
++	daddu	h1, h1, td		# h1 += e
++	v3mulu	d1, h1, $0		# word 1
++	sltu	tc, h1, td
++	daddiu	src, src, 16
++	daddu	h2, h2, tc
++	SWAP_BLOCK
++	v3mulu	d2, h2, $0		# word 2
++	daddu	h0, d0, m0		# h' = d + m (reduction follows)
++	sltu	ta, h0, m0
++	daddu	h1, d1, m1
++	sltu	tb, h1, m1
++	daddu	h2, hibit, tb
++	v3mulu	d3, $0, $0		# word 3 (drain)
++	andi	tc, d2, 3
++	dsubu	td, d2, tc		# d2 & ~3
++	dsrl	d2, d2, 2
++	daddu	h2, h2, tc		# h2 = (d2 & 3) + hibit + carry
++	daddu	h0, h0, td		# h0 += d2 & ~3
++	sltu	tc, h0, td
++	dins	d2, d3, 62, 2		# (d2 >> 2) | (d3 << 62)
++	daddu	ta, ta, tc
++	bne	src, last, 1b
++	 daddu	h0, h0, d2		# h0 += it (carry and e pending)
++
++.endm
++
++	.text
++	.set	push
++	.set	noat
++	.set	noreorder
++	.set	arch=octeon
++
++	.align	5
++	.globl	poly1305_blocks_octeon
++	.ent	poly1305_blocks_octeon
++poly1305_blocks_octeon:
++	.frame	$29, 0, $31
++	li	tc, -16
++	and	last, last, tc		# len & ~15
++	beqz	last, .Lret
++	 daddu	last, src, last		# end of the last block
++
++	ld	h0, 0(ctx)
++	ld	h1, 8(ctx)
++	ld	h2, 16(ctx)
++	ld	ta, 24(ctx)		# r0
++	ld	tb, 32(ctx)		# r1
++	mtm0	ta			# M = r (upper words zero)
++	mtm1	tb
++	mtm2	$0
++	mtp0	$0			# P = 0
++	mtp1	$0
++	mtp2	$0
++
++	LOAD_BLOCK 0			# h += first block
++	daddiu	src, src, 16
++	SWAP_BLOCK
++	daddu	h0, h0, m0
++	sltu	ta, h0, m0
++	daddu	h1, h1, m1
++	sltu	tb, h1, m1
++	daddu	h1, h1, ta
++	sltu	ta, h1, ta
++	daddu	h2, h2, hibit
++	daddu	h2, h2, tb
++	daddu	h2, h2, ta
++	move	d2, $0			# nothing pending for the first round
++	move	d3, $0
++	beq	src, last, .Ltail
++	 move	ta, $0
++	andi	tc, src, 7
++	bnez	tc, .Lunaligned
++	 nop
++
++	BLOCK_LOOP 1
++	b	.Ltail
++	 nop
++
++.Lunaligned:
++	BLOCK_LOOP 0
++
++.Ltail:
++	v3mulu	d0, h0, $0		# last block
++	PENDING_E
++	daddu	h1, h1, td
++	v3mulu	d1, h1, $0
++	sltu	tc, h1, td
++	daddu	h2, h2, tc
++	v3mulu	d2, h2, $0
++	v3mulu	d3, $0, $0
++	andi	tc, d2, 3
++	dsubu	td, d2, tc
++	dsrl	d2, d2, 2
++	move	h2, tc			# h2 = d2 & 3
++	daddu	h0, d0, td
++	sltu	ta, h0, td
++	dins	d2, d3, 62, 2
++	daddu	h0, h0, d2
++	PENDING_E
++	daddu	h1, d1, td
++	sltu	tc, h1, td
++	daddu	h2, h2, tc
++	sd	h0, 0(ctx)
++	sd	h1, 8(ctx)
++	sd	h2, 16(ctx)
++.Lret:
++	jr	$31
++	 nop
++	.end	poly1305_blocks_octeon
++	.set	pop
