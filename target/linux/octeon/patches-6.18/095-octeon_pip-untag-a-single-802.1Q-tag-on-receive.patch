@@ -3,14 +3,14 @@ Subject: [PATCH] octeon_pip: untag a single 802.1Q tag on receive (NETIF_F_HW_VL
 
 The PIP parses the VLAN tag of a frame (WQE word 2: VLAN_VALID, VLAN_STACKED) but the driver left the tag in the frame: GRO walked the offload list twice per packet (dev_gro_receive for 8021Q, vlan_gro_receive for the IP offload: vlan_gro_receive 3.3 % of the forwarding core on the EdgeRouter 4 with a tagged 64 byte flood, 95 cycles per packet) and the stack untagged the list head in software (skb_vlan_untag, a memmove per list).
 
-Take a single 802.1Q tag out of the frame before eth_type_trans(): the TPID and the full TCI from the frame (the WQE has no priority bits), the MAC addresses moved up by four bytes with three word loads before the first store, the tag into the skb (__vlan_hwaccel_put_tag). GRO then takes the IP packet directly and the stack's vlan_do_receive() delivers to the VLAN device as before. What stays in software: stacked tags and other TPIDs (802.1ad: the frame is left alone, NETIF_F_HW_VLAN_STAG_RX is not advertised), the transmit side's tag insertion (the PKO inserts no tags; NETIF_F_HW_VLAN_CTAG_TX is not advertised), and the XDP and pktgen paths (XDP sees the raw frame; a program that rewrote it does not match the TPID test). The PIP's L4 checksum verdict holds, the tag's bytes are outside the L3/L4 sums; the CHECKSUM_COMPLETE experiment (090) subtracts the removed tag in its MAC-header mode. ethtool -K <port> rx-vlan-offload off restores the old behaviour.
+Take a single 802.1Q tag out of the frame before eth_type_trans(): the TPID and the full TCI from the frame (the WQE has no priority bits), the MAC addresses moved up by four bytes with three word loads before the first store, the tag into the skb (__vlan_hwaccel_put_tag). GRO then takes the IP packet directly and the stack's vlan_do_receive() delivers to the VLAN device as before. What stays in software: stacked tags and other TPIDs (802.1ad: the frame is left alone, NETIF_F_HW_VLAN_STAG_RX is not advertised), the transmit side's tag insertion (the PKO inserts no tags; NETIF_F_HW_VLAN_CTAG_TX is not advertised), and the XDP and pktgen paths (XDP sees the raw frame; a program that rewrote it does not match the TPID test). The PIP's L4 checksum verdict holds, the tag's bytes are outside the L3/L4 sums. ethtool -K <port> rx-vlan-offload off restores the old behaviour.
 
 Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 ---
 --- a/drivers/net/ethernet/cavium/octeon/octeon_pip_hw.h
 +++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_hw.h
-@@ -281,6 +281,9 @@ struct opip_wqe {
+@@ -279,6 +279,9 @@ struct opip_wqe {
  
  /* word2: how the packet was parsed and stored */
  #define OPIP_WQE2_BUFS		GENMASK_ULL(63, 56)
@@ -20,9 +20,21 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  #define OPIP_WQE2_TCP_OR_UDP	BIT_ULL(18)
  #define OPIP_WQE2_IS_V6		BIT_ULL(16)
  #define OPIP_WQE2_L4_ERROR	BIT_ULL(14)
+--- a/drivers/net/ethernet/cavium/octeon/octeon_pip_main.c
++++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_main.c
+@@ -1178,6 +1178,9 @@ static struct net_device *opip_alloc_port(struct opip *opip,
+ 			   NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM | NETIF_F_RXHASH;
+ 	dev->features |= dev->hw_features;
+ 	dev->vlan_features |= dev->hw_features;
++	/* The receive untag of a single 802.1Q tag, see opip_rx_vlan_untag() */
++	dev->hw_features |= NETIF_F_HW_VLAN_CTAG_RX;
++	dev->features |= NETIF_F_HW_VLAN_CTAG_RX;
+ 	dev->hw_enc_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
+ 	xdp_set_features_flag(dev, NETDEV_XDP_ACT_BASIC |
+ 			      NETDEV_XDP_ACT_REDIRECT |
 --- a/drivers/net/ethernet/cavium/octeon/octeon_pip_rx.c
 +++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_rx.c
-@@ -23,6 +23,7 @@
+@@ -20,6 +20,7 @@
  #include <linux/skbuff_ref.h>
  #include <linux/slab.h>
  #include <linux/smp.h>
@@ -30,22 +42,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  #include <linux/workqueue.h>
  #include <net/page_pool/helpers.h>
  #include <net/xdp.h>
-@@ -608,6 +609,13 @@ static noinline void opip_rx_csum_comple
- 				     csum_partial(skb_mac_header(skb),
- 						  skb->data -
- 						  skb_mac_header(skb), 0));
-+		if (skb_vlan_tag_present(skb)) {
-+			__be16 tag[2] = { skb->vlan_proto,
-+					  htons(skb_vlan_tag_get(skb)) };
-+
-+			skb->csum = csum_sub(skb->csum,
-+					     csum_partial(tag, sizeof(tag), 0));
-+		}
- 		break;
- 	case 4:
- 		skb->csum = csum_add(hw, csum_partial(skb->data, nhoff + ihl,
-@@ -619,6 +627,39 @@ static noinline void opip_rx_csum_comple
- 	skb->ip_summed = CHECKSUM_COMPLETE;
+@@ -529,6 +530,39 @@ static struct sk_buff *opip_rx_copy_skb(struct opip_group *group,
+ 	return skb;
  }
  
 +/*
@@ -84,7 +82,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  /* Always inline: with two callers gcc calls it out of line, per packet */
  static __always_inline void opip_rx_deliver(struct opip_group *group,
  					    struct net_device *dev,
-@@ -631,6 +672,10 @@ static __always_inline void opip_rx_deli
+@@ -541,6 +575,10 @@ static __always_inline void opip_rx_deliver(struct opip_group *group,
  
  	/* A port has a receive queue per group, as XDP has */
  	skb_record_rx_queue(skb, group->group);
@@ -95,15 +93,3 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  	skb->protocol = eth_type_trans(skb, dev);
  	/*
  	 * The PIP's flow tag of an IP packet is the stack's flow hash: GRO
---- a/drivers/net/ethernet/cavium/octeon/octeon_pip_main.c
-+++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_main.c
-@@ -1178,6 +1178,9 @@ static struct net_device *opip_alloc_por
- 			   NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM | NETIF_F_RXHASH;
- 	dev->features |= dev->hw_features;
- 	dev->vlan_features |= dev->hw_features;
-+	/* The receive untag of a single 802.1Q tag, see opip_rx_vlan_untag() */
-+	dev->hw_features |= NETIF_F_HW_VLAN_CTAG_RX;
-+	dev->features |= NETIF_F_HW_VLAN_CTAG_RX;
- 	dev->hw_enc_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
- 	xdp_set_features_flag(dev, NETDEV_XDP_ACT_BASIC |
- 			      NETDEV_XDP_ACT_REDIRECT |
