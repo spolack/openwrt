@@ -1,0 +1,133 @@
+From: Simon Polack <spolack+git@mailbox.org>
+Subject: [PATCH] MIPS: lib: csum_partial: carry-free accumulation of the bulk on 64-bit
+
+The bulk loops summed each 64-bit word with ADDC: daddu, sltu, daddu, three dependent instructions per word, serialised through the running sum, 12 or more cycles per 32 bytes on an in-order dual-issue core (OCTEON III: ~0.4 cycles per byte, 580 cycles for the 1448 byte TCP segments the GRE decap validates in GRO, 5.7 % of the decap core).
+
+On 64-bit kernels accumulate the bulk carry-free: the high halves of the words into one register, the whole words into another, plain daddu, no carry chain (the sums stay far below 2^64 for int lengths). The sum of the low halves is the second accumulator minus the first shifted up, and both are folded into the one's complement sum before the tail. Pairs of words are consumed with the loads of the next pair issued three instructions after the registers' last use, so the 128 byte loop runs 8 instructions per 16 bytes with no dependent chain longer than one add: the issue limit, about 0.28 cycles per byte. The 32-bit code path is unchanged.
+
+Checked in userspace (vectors/test-csum, qemu-mips64, OpenWrt toolchain): old and new routine agree with a C reference modulo 0xffff over all lengths 0..4095 and 16 alignments, random and all-ones data, random partial sums (250000 cases).
+
+Signed-off-by: Simon Polack <spolack+git@mailbox.org>
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+--- a/arch/mips/lib/csum_partial.S
++++ b/arch/mips/lib/csum_partial.S
+@@ -85,6 +85,42 @@
+ #ifdef USE_DOUBLE
+ #define CSUM_BIGCHUNK(src, offset, sum, _t0, _t1, _t2, _t3)	\
+ 	CSUM_BIGCHUNK1(src, offset, sum, _t0, _t1, _t2, _t3)
++
++/*
++ * Carry-free accumulation of the bulk on 64-bit kernels: the high halves
++ * of the words go into t5, the whole words into t6, with plain daddu (no
++ * end-around carry: ADDC is a chain of three dependent instructions per
++ * word, the two accumulators here are independent and run in parallel
++ * on a dual-issue core). The sum of the low halves is t6 - (t5 << 32),
++ * exact as both sums stay below 2^64 (lengths are ints), and
++ * t5 + (t6 - (t5 << 32)) is congruent to the one's complement sum of the
++ * words modulo 2^32 - 1, which the fold at the end takes. CSUM_PAIR
++ * consumes two words and loads the next two into the registers they
++ * occupied, three instructions after their last use (load-use delay).
++ */
++#define CSUM_WORDS(_w0, _w1)					\
++	dsrl32	v1, _w0, 0;					\
++	daddu	t6, t6, _w0;					\
++	dsrl32	a3, _w1, 0;					\
++	daddu	t5, t5, v1;					\
++	daddu	t6, t6, _w1;					\
++	daddu	t5, t5, a3
++
++#define CSUM_PAIR(_w0, _w1, off0, off1)				\
++	dsrl32	v1, _w0, 0;					\
++	daddu	t6, t6, _w0;					\
++	LOAD	_w0, off0(src);					\
++	dsrl32	a3, _w1, 0;					\
++	daddu	t5, t5, v1;					\
++	daddu	t6, t6, _w1;					\
++	LOAD	_w1, off1(src);					\
++	daddu	t5, t5, a3
++
++#define CSUM_LOAD4(off)						\
++	LOAD	t0, (off + UNIT(0))(src);			\
++	LOAD	t1, (off + UNIT(1))(src);			\
++	LOAD	t3, (off + UNIT(2))(src);			\
++	LOAD	t4, (off + UNIT(3))(src)
+ #else
+ #define CSUM_BIGCHUNK(src, offset, sum, _t0, _t1, _t2, _t3)	\
+ 	CSUM_BIGCHUNK1(src, offset, sum, _t0, _t1, _t2, _t3);	\
+@@ -107,6 +143,10 @@
+ EXPORT_SYMBOL(csum_partial)
+ 	move	sum, zero
+ 	move	t7, zero
++#ifdef USE_DOUBLE
++	move	t5, zero
++	move	t6, zero
++#endif
+ 
+ 	sltiu	t8, a1, 0x8
+ 	bnez	t8, .Lsmall_csumcpy		/* < 8 bytes to copy */
+@@ -194,10 +234,22 @@
+ 	/* Four 128-byte chunks ahead: the sum is the first touch of the data */
+ 	kernel_pref(0, 0x200(src))
+ #endif
++#ifdef USE_DOUBLE
++	CSUM_LOAD4(0x00)
++	CSUM_PAIR(t0, t1, 0x20, 0x28)
++	CSUM_PAIR(t3, t4, 0x30, 0x38)
++	CSUM_PAIR(t0, t1, 0x40, 0x48)
++	CSUM_PAIR(t3, t4, 0x50, 0x58)
++	CSUM_PAIR(t0, t1, 0x60, 0x68)
++	CSUM_PAIR(t3, t4, 0x70, 0x78)
++	CSUM_WORDS(t0, t1)
++	CSUM_WORDS(t3, t4)
++#else
+ 	CSUM_BIGCHUNK(src, 0x00, sum, t0, t1, t3, t4)
+ 	CSUM_BIGCHUNK(src, 0x20, sum, t0, t1, t3, t4)
+ 	CSUM_BIGCHUNK(src, 0x40, sum, t0, t1, t3, t4)
+ 	CSUM_BIGCHUNK(src, 0x60, sum, t0, t1, t3, t4)
++#endif
+ 	LONG_SUBU	t8, t8, 0x01
+ 	.set	reorder				/* DADDI_WAR */
+ 	PTR_ADDU	src, src, 0x80
+@@ -209,8 +261,16 @@
+ 	 andi	t2, a1, 0x20
+ 
+ .Lmove_64bytes:
++#ifdef USE_DOUBLE
++	CSUM_LOAD4(0x00)
++	CSUM_PAIR(t0, t1, 0x20, 0x28)
++	CSUM_PAIR(t3, t4, 0x30, 0x38)
++	CSUM_WORDS(t0, t1)
++	CSUM_WORDS(t3, t4)
++#else
+ 	CSUM_BIGCHUNK(src, 0x00, sum, t0, t1, t3, t4)
+ 	CSUM_BIGCHUNK(src, 0x20, sum, t0, t1, t3, t4)
++#endif
+ 	PTR_ADDU	src, src, 0x40
+ 
+ 1:
+@@ -218,11 +278,24 @@
+ 	 andi	t8, a1, 0x1c
+ 
+ .Lmove_32bytes:
++#ifdef USE_DOUBLE
++	CSUM_LOAD4(0x00)
++	CSUM_WORDS(t0, t1)
++	CSUM_WORDS(t3, t4)
++#else
+ 	CSUM_BIGCHUNK(src, 0x00, sum, t0, t1, t3, t4)
++#endif
+ 	andi	t8, a1, 0x1c
+ 	PTR_ADDU	src, src, 0x20
+ 
+ .Ldo_end_words:
++#ifdef USE_DOUBLE
++	/* The bulk's accumulators into the one's complement sum */
++	dsll32	v1, t5, 0
++	dsubu	t6, t6, v1
++	ADDC(sum, t5)
++	ADDC(sum, t6)
++#endif
+ 	beqz	t8, .Lsmall_csumcpy
+ 	 andi	t2, a1, 0x3
+ 	LONG_SRL	t8, t8, 0x2
