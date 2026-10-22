@@ -3,8 +3,9 @@ From: Simon Polack <spolack+git@mailbox.org>
 Subject: [PATCH] net: ethernet: cavium: add octeon_pip
 
 Backport to 6.18 of the octeon_pip series prepared for net-next and not
-posted yet (15 patches, branch octeon-pip-rfc10, 6c34e76095dd on
-net-next 98c2ad4f5d80), squashed into one patch: the driver for the Ethernet
+posted yet (15 patches, branch octeon-pip-rfc-v1 of
+https://github.com/spolack/linux, 6c34e76095dd on net-next
+98c2ad4f5d80), squashed into one patch: the driver for the Ethernet
 ports behind the PIP/IPD and PKO units of OCTEON, OCTEON+, OCTEON II and
 the CN70XX/CN71XX, with phylink and the SGMII/QSGMII/1000BASE-X PCS,
 the RGMII/GMII/XAUI ports, a receive group per CPU, transmit completions
