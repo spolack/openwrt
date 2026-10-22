@@ -22,7 +22,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  #define OPIP_WQE2_L4_ERROR	BIT_ULL(14)
 --- a/drivers/net/ethernet/cavium/octeon/octeon_pip_main.c
 +++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_main.c
-@@ -1178,6 +1178,9 @@ static struct net_device *opip_alloc_port(struct opip *opip,
+@@ -1178,6 +1178,9 @@ static struct net_device *opip_alloc_por
  			   NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM | NETIF_F_RXHASH;
  	dev->features |= dev->hw_features;
  	dev->vlan_features |= dev->hw_features;
@@ -42,7 +42,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  #include <linux/workqueue.h>
  #include <net/page_pool/helpers.h>
  #include <net/xdp.h>
-@@ -529,6 +530,39 @@ static struct sk_buff *opip_rx_copy_skb(struct opip_group *group,
+@@ -529,6 +530,39 @@ static struct sk_buff *opip_rx_copy_skb(
  	return skb;
  }
  
@@ -82,7 +82,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  /* Always inline: with two callers gcc calls it out of line, per packet */
  static __always_inline void opip_rx_deliver(struct opip_group *group,
  					    struct net_device *dev,
-@@ -541,6 +575,10 @@ static __always_inline void opip_rx_deliver(struct opip_group *group,
+@@ -541,6 +575,10 @@ static __always_inline void opip_rx_deli
  
  	/* A port has a receive queue per group, as XDP has */
  	skb_record_rx_queue(skb, group->group);
