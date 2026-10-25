@@ -1,0 +1,12 @@
+#!/bin/sh /etc/rc.common
+# The boot snapshot of octeon-health, once the links had time to come up
+
+START=99
+
+boot() {
+	(sleep 20; /usr/sbin/octeon-health boot) > /dev/null 2>&1 &
+}
+
+start() {
+	:
+}
