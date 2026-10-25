@@ -1,0 +1,8 @@
+#!/bin/sh
+/etc/init.d/octeon-health enable
+cat >> /etc/banner <<'BANNER'
+ OCTEON test image: run  octeon-health  for the health report
+ (snapshot, benchmarks with your PC, one .tar.gz to attach).
+ -----------------------------------------------------
+BANNER
+exit 0

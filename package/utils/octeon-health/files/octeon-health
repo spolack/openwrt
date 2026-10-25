@@ -1,0 +1,1039 @@
+#!/bin/sh
+# octeon-health: an OCTEON packet I/O health report for remote debugging.
+#
+#   octeon-health            interactive: snapshot, benchmarks with your PC, report
+#   octeon-health boot       the snapshot right after boot (run by /etc/init.d/octeon-health)
+#   octeon-health snapshot   only the snapshot, no benchmarks
+#
+# Environment: PEER=<pc ip> skips the question, T=<seconds per run> (10),
+# N=<repeats> (3), NOFWD=1 skips the forwarding test, NOAB=1 skips the
+# conduit SKIP A/B test, NOPIN=1 skips the pinning sweep, PORT=<n> another
+# iperf3 port than 5201, NOBENCH=1 runs only the forwarding test,
+# FWD_PEER=<ip> forwards to a server that is already set up (no namespace),
+# MODE=pcclient runs the benchmarks the other way round without a terminal.
+#
+# Everything lands in /tmp/octeon-health/<stamp>/ and in one .tar.gz next to it.
+# MACs past their OUI, public addresses and DHCP lines are masked in it.
+
+BASE=/tmp/octeon-health
+T=${T:-10}
+N=${N:-3}
+case "$T" in ''|*[!0-9]*) T=10 ;; esac
+[ "$T" -ge 5 ] || T=5	# the CPU window is 2 s in to 2 s before the end
+case "$N" in ''|*[!0-9]*|0) N=3 ;; esac
+NETNS_NET=10.99.0
+VERSION=1
+
+# ---------------------------------------------------------------- helpers
+
+say() { echo "$*"; [ -n "$LOG" ] && echo "$*" >> "$LOG"; }
+hdr() { say ""; say "=== $*"; }
+
+# ask "question" "default": the answer in $ans
+ask() {
+	if [ -n "$NONINTERACTIVE" ]; then ans=$2; return; fi
+	printf '%s [%s] ' "$1" "$2" > /dev/tty
+	read -r ans < /dev/tty || ans=
+	[ -z "$ans" ] && ans=$2
+}
+pause() {
+	[ -n "$NONINTERACTIVE" ] && return
+	printf '%s ' "${1:-Press Enter to continue.}" > /dev/tty
+	read -r _ < /dev/tty
+}
+have() { command -v "$1" > /dev/null 2>&1; }
+# instructions for the tester: the terminal, or stderr when there is none
+tell() { if [ -n "$NONINTERACTIVE" ]; then cat >&2; else cat > /dev/tty; fi; }
+
+# cap FILE CMD...: append "### CMD" and its output (stderr too) to FILE
+cap() {
+	f=$1; shift
+	{ echo "### $*"; sh -c "$*" 2>&1; echo; } >> "$f"
+}
+
+# mask FILE...: what a public report must not show: the MACs past their OUI
+# (also inside EUI-64 IPv6 addresses), public IPv4 and global IPv6 addresses, SFP serial numbers
+mask() {
+	for f in "$@"; do
+		[ -f "$f" ] || continue
+		awk '
+		function priv(a,  o) { split(a, o, ".")
+			return o[1] == 10 || o[1] == 127 || o[1] == 0 || o[1] >= 224 ||
+				(o[1] == 192 && o[2] == 168) || (o[1] == 172 && o[2] >= 16 && o[2] <= 31) ||
+				(o[1] == 169 && o[2] == 254) || (o[1] == 100 && o[2] >= 64 && o[2] <= 127) }
+		# an address, not a version: octets up to 255, not part of a longer
+		# dotted number, not after "version"/"ver"/"v"
+		function ip4(a, before, after,  o) { split(a, o, ".")
+			if (o[1] > 255 || o[2] > 255 || o[3] > 255 || o[4] > 255) return 0
+			if (before ~ /[0-9.]$/ || after ~ /^(\.?[0-9])/) return 0
+			return before !~ /([Vv]ersion|[Vv]er|[^a-zA-Z][vV])[:= ]*$/ }
+		# the character before the match: from what is already done when the
+		# match is at the start of the rest (substr(s, 0, 1) is not "")
+		function prev(s, o) { return RSTART > 1 ? substr(s, 1, RSTART - 1) : o }
+		{ s = $0; o = ""
+		  while (match(s, /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/)) {
+			a = substr(s, RSTART, RLENGTH); b = prev(s, o)
+			if (ip4(a, b, substr(s, RSTART + RLENGTH, 2)) && !priv(a)) a = "x.x.x.x"
+			o = o substr(s, 1, RSTART - 1) a; s = substr(s, RSTART + RLENGTH) }
+		  s = o s; o = ""
+		  # global unicast IPv6 (2000::/3): "::" or at least 4 colons, not a time
+		  while (match(s, /[23][0-9a-fA-F]?[0-9a-fA-F]?[0-9a-fA-F]?:[0-9a-fA-F:]*[0-9a-fA-F:]/)) {
+			a = substr(s, RSTART, RLENGTH); n = gsub(/:/, ":", a)
+			b = prev(s, o); pre = substr(b, length(b), 1)
+			mac = a ~ /^[0-9a-fA-F][0-9a-fA-F](:[0-9a-fA-F][0-9a-fA-F])+$/
+			if ((index(a, "::") || n >= 4) && pre !~ /[0-9a-zA-Z]/ && !mac) a = "2xxx:(masked)"
+			o = o substr(s, 1, RSTART - 1) a; s = substr(s, RSTART + RLENGTH) }
+		  print o s }' "$f" |
+		sed -E -e 's/(([0-9a-fA-F]{2}:){3})([0-9a-fA-F]{2}:){2}[0-9a-fA-F]{2}/\1xx:xx:xx/g' \
+			-e 's/([0-9a-fA-F]{2})ff:fe[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,4}/\1ff:fexx:xxxx/g' \
+			-e 's/(Vendor SN[^:]*:).*/\1 (masked)/' \
+			-e 's/( sn +)[^ ]+( +dc )/\1(masked)\2/' > "$f.m" && mv "$f.m" "$f"
+	done
+}
+
+rd64() { devmem "$1" 64 2>/dev/null || echo "?"; }
+hex() { printf '0x%x' "$1"; }
+
+# the netdevs of octeon_pip, in name order
+opip_devs() {
+	for d in /sys/class/net/*; do
+		drv=$(readlink "$d/device/driver" 2>/dev/null)
+		[ "${drv##*/}" = octeon_pip ] && echo "${d##*/}"
+	done
+}
+
+# port_info DEV: sets iface, index (from the DT node) and ipd (from debugfs)
+port_info() {
+	iface=? index=? ipd=?
+	node=$(readlink -f "/sys/class/net/$1/of_node" 2>/dev/null)
+	case "$node" in
+	*interface@*/ethernet@*)
+		iface=${node##*interface@}; iface=${iface%%/*}
+		index=${node##*ethernet@}; index=${index%%/*} ;;
+	esac
+	for s in /sys/kernel/debug/octeon_pip/*/status; do
+		[ -r "$s" ] || continue
+		p=$(sed -n "s/^$1 port \([0-9]*\) queues.*/\1/p" "$s")
+		[ -n "$p" ] && ipd=$p
+	done
+}
+
+# the rx header a DSA tagger puts in front of the IP header: "bytes where"
+# (etype: at the EtherType's place, prepend: before the MAC addresses),
+# "0 none" for tail and VLAN taggers, empty for unknown ones
+tag_layout() {
+	case "$1" in
+	qca) echo "2 etype" ;;
+	brcm|mtk|dsa|rtl4a|lan9303) echo "4 etype" ;;
+	edsa|rtl8_4) echo "8 etype" ;;
+	brcm-prepend) echo "4 prepend" ;;
+	ar9331) echo "2 prepend" ;;
+	gswip) echo "8 prepend" ;;
+	ocelot|seville) echo "16 prepend" ;;
+	ksz*|trailer|rtl8_4t|xrs700x|hellcreek|ocelot-8021q|sja1105|sja1110|lan937x|vsc73xx-8021q|none)
+		echo "0 none" ;;
+	esac
+}
+
+pip_cfg_addr() { hex $((0x11800A0000200 + $1 * 8)); }
+
+# cpu_snap FILE: one line per CPU: "cpuN busy total softirq"
+cpu_snap() {
+	awk '/^cpu[0-9]/ { t = 0; for (i = 2; i <= NF; i++) t += $i;
+		print $1, t - $5 - $6, t, $8 }' /proc/stat > "$1"
+}
+# cpu_delta A B: "cpu0 busy% sirq% cpu1 ..." between two snapshots
+cpu_delta() {
+	awk 'NR == FNR { b[$1] = $2; t[$1] = $3; s[$1] = $4; next }
+	{ dt = $3 - t[$1]; if (dt <= 0) dt = 1
+	  printf "%s %d/%d ", $1, 100 * ($2 - b[$1]) / dt, 100 * ($4 - s[$1]) / dt }
+	END { print "" }' "$1" "$2"
+}
+# the rx/tx bytes and packets of all octeon_pip ports: the MAC counters of
+# ethtool's eth-mac group, read fresh; sysfs (updated once a second by the
+# driver's worker) when ethtool has no groups
+net_snap() {
+	for d in $(opip_devs); do
+		m=$(ethtool -S "$d" --groups eth-mac 2>/dev/null | awk -F': *' '
+			{ gsub(/^ +/, "", $1) }
+			$1 == "eth-mac-OctetsReceivedOK" { rb = $2 }
+			$1 == "eth-mac-OctetsTransmittedOK" { tb = $2 }
+			$1 == "eth-mac-FramesReceivedOK" { rp = $2 }
+			$1 == "eth-mac-FramesTransmittedOK" { tp = $2 }
+			END { if (rp != "") print rb + 0, tb + 0, rp + 0, tp + 0 }')
+		if [ -z "$m" ]; then
+			s=/sys/class/net/$d/statistics
+			m=$(echo $(cat $s/rx_bytes $s/tx_bytes $s/rx_packets $s/tx_packets))
+		fi
+		echo "$d $m"
+	done > "$1"
+}
+net_delta() {	# A B SECONDS: "rx Mbit/s tx Mbit/s rx kpps tx kpps" summed
+	awk -v t="$3" 'NR == FNR { for (i = 2; i <= 5; i++) a[$1, i] = $i; next }
+	{ for (i = 2; i <= 5; i++) d[i] += $i - a[$1, i] }
+	END { printf "rx %d Mbit/s tx %d Mbit/s rx %d kpps tx %d kpps\n",
+		d[2] * 8 / t / 1e6, d[3] * 8 / t / 1e6, d[4] / t / 1e3, d[5] / t / 1e3 }' "$1" "$2"
+}
+
+# fwd_snap RUN a|b: softnet_stat and the qdisc counters of the octeon_pip ports
+fwd_snap() {
+	[ -r /proc/net/softnet_stat ] && cat /proc/net/softnet_stat > "$OUT/fwd/$1-softnet.$2"
+	have tc && for d in $(opip_devs); do
+		echo "dev $d"; tc -s qdisc show dev "$d" 2>/dev/null
+	done > "$OUT/fwd/$1-tc.$2"
+}
+
+# offload_flows TARGET: "sport 1|0" for each conntrack entry of the test
+# flow, 1 when it has [OFFLOAD]; n/a without conntrack or /proc/net/nf_conntrack
+offload_flows() {
+	if have conntrack; then ct="conntrack -L -p tcp --orig-dst $1 --orig-port-dst ${PORT:-5201}"
+	elif [ -r /proc/net/nf_conntrack ]; then ct="cat /proc/net/nf_conntrack"
+	else echo n/a; return; fi
+	$ct 2>/dev/null | grep -F "dst=$1 " | grep -F "dport=${PORT:-5201} " |
+		awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^sport=/) { print substr($i, 7), ($0 ~ /OFFLOAD/) ? 1 : 0; break } }'
+}
+
+# fwd_diag RUN DIR: the softnet and qdisc deltas, the PIP samples and the
+# warnings of one forwarding run, markdown
+fwd_diag() {
+	F=$OUT/fwd
+	echo "#### forward iperf3 ${2:-(plain)}"
+	echo '```'
+	if [ -s "$F/$1-softnet.a" ] && [ -s "$F/$1-softnet.b" ]; then
+		# hex without 0x; column 13 is the CPU, 32-bit counters may wrap
+		awk 'function h(s,  i, v) { v = 0; s = tolower(s)
+			for (i = 1; i <= length(s); i++) v = v * 16 + index("0123456789abcdef", substr(s, i, 1)) - 1
+			return v }
+		function d(x, y) { x = h(y) - h(x); if (x < 0) x += 4294967296; return x }
+		{ c = NF >= 13 ? h($13) : FNR - 1 }
+		NR == FNR { for (i = 1; i <= 10; i++) a[c, i] = $i; next }
+		((c SUBSEP 1) in a) { printf "softnet cpu%d processed +%.0f dropped +%.0f time_squeeze +%.0f received_rps +%.0f\n",
+			c, d(a[c, 1], $1), d(a[c, 2], $2), d(a[c, 3], $3), d(a[c, 10], $10) }' "$F/$1-softnet.a" "$F/$1-softnet.b"
+	else
+		echo "softnet: /proc/net/softnet_stat unreadable"
+	fi
+	if [ -s "$F/$1-tc.a" ] && [ -s "$F/$1-tc.b" ]; then
+		# dropped/overlimits from the root qdisc's Sent line (mq sums its
+		# children), drop_overmemory summed (fq_codel prints it when non-zero)
+		awk 'FNR == 1 { f++ }
+		$1 == "dev" { d = $2; if (f == 1) o[++n] = d; root = 0; next }
+		$1 == "qdisc" { root = ($0 ~ / root( |$)/); next }
+		$1 == "Sent" && root { gsub(/[(),]/, " ")
+			v[f, d, "pkt"] = $4
+			for (i = 5; i < NF; i++) if ($i == "dropped" || $i == "overlimits") v[f, d, $i] = $(i + 1)
+			root = 0; next }
+		{ for (i = 1; i < NF; i++) if ($i == "drop_overmemory") v[f, d, "mem"] += $(i + 1) }
+		END { for (k = 1; k <= n; k++) { d = o[k]
+			p = v[2, d, "pkt"] - v[1, d, "pkt"]; dr = v[2, d, "dropped"] - v[1, d, "dropped"]
+			ol = v[2, d, "overlimits"] - v[1, d, "overlimits"]; m = v[2, d, "mem"] - v[1, d, "mem"]
+			if (p || dr || ol || m) { x++
+				printf "qdisc %s sent +%.0f pkt dropped +%.0f overlimits +%.0f drop_overmemory +%.0f\n", d, p, dr, ol, m } }
+			if (!x) print "qdisc: no packets through the octeon_pip qdiscs" }' "$F/$1-tc.a" "$F/$1-tc.b"
+	elif have tc; then
+		echo "qdisc: no tc output for the octeon_pip ports"
+	else
+		echo "qdisc: tc missing"
+	fi
+	if grep -q ' inflight' "$F/$1-pip.txt" 2>/dev/null; then
+		# "dev port N queues A-B inflight v..." (values from field 7) and
+		# "dev port N pko words v..." (from field 6), per sample
+		awk '/^# sample/ { s = $3; next }
+		$4 == "queues" { q[$1] = $5; for (i = 7; i <= NF; i++) fl[$1, i - 7] = $i + 0
+			l = $0; sub(/.* inflight/, "", l); inf[$1] = l; next }
+		$4 == "pko" { busy = 0
+			for (i = 6; i <= NF; i++) { k = i - 6
+				if (fl[$1, k] || $i + 0) busy = 1
+				if (fl[$1, k] >= 250 && $i + 0 == 0) { split(q[$1], r, "-")
+					w[++nw] = sprintf("WARNING: tx completion starvation: %s txq %d (PKO queue %d) inflight %d, pko words 0 (sample %d)",
+						$1, k, r[1] + k, fl[$1, k], s) } }
+			if (busy) { p = $0; sub(/.* words/, "", p); y++
+				printf "sample %d %s inflight%s, pko words%s\n", s, $1, inf[$1], p } }
+		END { if (!y) print "pip samples: all tx queues empty"
+			for (i = 1; i <= nw; i++) print w[i] }' "$F/$1-pip.txt"
+	else
+		echo "pip samples: no 'inflight' lines in octeon_pip debugfs"
+	fi
+	# the entries of this run only: client ports not seen before it
+	if grep -q n/a "$F/$1-offload.1" 2>/dev/null || [ ! -r "$F/$1-offload.1" ]; then
+		echo "OFFLOAD entries of the test flow: n/a (no conntrack, no /proc/net/nf_conntrack)"
+	else
+		set -- $(awk 'FILENAME == ARGV[1] { if (!($1 in old)) k++; old[$1] = 1; next }
+			!($1 in old) { n++; o += $2 } END { print n + 0, o + 0, k + 0 }' "$F/$1-offload.0" "$F/$1-offload.1")
+		echo "OFFLOAD entries of the test flow (5 s in): $2 of $1 offloaded ($3 entries left from earlier runs not counted)"
+		if [ "$1" = 0 ]; then
+			echo "test flow not in conntrack (no firewall ruleset, sample too early, wrong PORT?)"
+		elif [ "$2" = 0 ] && have nft && nft list flowtables 2>/dev/null | grep -q '^[[:space:]]*flowtable '; then
+			echo "WARNING: a flowtable exists but the test flow is not offloaded: the flowtable probably lacks the lower device (only VLAN uppers listed?), or no 'flow add' rule matches"
+		fi
+	fi
+	echo '```'
+}
+
+# ---------------------------------------------------------------- snapshot
+
+snapshot() {	# DIR
+	S=$1; mkdir -p "$S"
+
+	cap "$S/system.txt" "uname -a"
+	cap "$S/system.txt" "cat /etc/openwrt_release"
+	cap "$S/system.txt" "cat /tmp/sysinfo/board_name /tmp/sysinfo/model"
+	cap "$S/system.txt" "cat /proc/cmdline"
+	cap "$S/system.txt" "cat /proc/cpuinfo"
+	cap "$S/system.txt" "cat /proc/meminfo"
+	cap "$S/system.txt" "uptime"
+	cap "$S/system.txt" "cat /proc/mounts"
+	[ -r /proc/config.gz ] && cp /proc/config.gz "$S/kernel-config.gz"
+	# the live device tree, without the MAC addresses (the flat
+	# /sys/firmware/fdt is not copied: it holds them too)
+	if [ -d /sys/firmware/devicetree ]; then
+		rm -rf "$S/.dt"; mkdir -p "$S/.dt"
+		cp -r /sys/firmware/devicetree "$S/.dt/" 2>/dev/null
+		find "$S/.dt" -name '*mac-address*' -exec rm -f {} \; 2>/dev/null
+		tar -C "$S/.dt" -czf "$S/devicetree.tar.gz" devicetree 2>/dev/null
+		rm -rf "$S/.dt"
+	fi
+
+	dmesg > "$S/dmesg.txt" 2>&1
+	# without the DHCP lines: they name the LAN's clients
+	logread 2>&1 | grep -vE 'dnsmasq-dhcp|odhcpd|DHCP(ACK|OFFER|REQUEST|DISCOVER)' > "$S/logread.txt"
+	grep 'octeon-bootregs:' "$S/dmesg.txt" | sed 's/.*octeon-bootregs: //' > "$S/bootregs.txt"
+
+	cap "$S/net.txt" "ip -d -s -s link show"
+	cap "$S/net.txt" "ip addr show"
+	cap "$S/net.txt" "ip -4 route show table all"
+	cap "$S/net.txt" "ip -6 route show"
+	have bridge && cap "$S/net.txt" "bridge -d link show; bridge vlan show"
+	cap "$S/net.txt" "cat /proc/net/dev /proc/net/softnet_stat /proc/net/snmp"
+	cap "$S/net.txt" "uci show network | sed -E 's/((key|password|psk|secret|token|auth|username|user)[^=]*=).*/\\1REDACTED/'"
+
+	for d in /sys/class/net/*; do
+		n=${d##*/}
+		[ "$n" = lo ] && continue
+		f=$S/ethtool-$n.txt
+		for o in "" -i -k -g -a -l -c --show-eee -S -m; do
+			cap "$f" "ethtool $o $n"
+		done
+		cap "$f" "ethtool -S $n --all-groups"
+		cap "$f" "cd $d && for a in speed duplex carrier carrier_changes operstate mtu iflink ifindex threaded napi_defer_hard_irqs gro_flush_timeout; do echo \$a=\$(cat \$a 2>/dev/null); done"
+		cap "$f" "readlink -f $d/of_node $d/device $d/device/driver"
+		cap "$f" "for q in $d/queues/*; do echo \$q rps=\$(cat \$q/rps_cpus 2>/dev/null) xps=\$(cat \$q/xps_cpus 2>/dev/null); done"
+		[ -r "$d/dsa/tagging" ] && cap "$f" "cat $d/dsa/tagging"
+	done
+
+	# pinning: who handles what where
+	P=$S/pinning.txt
+	cap "$P" "grep -c ^processor /proc/cpuinfo; cat /sys/devices/system/cpu/online"
+	cap "$P" "cat /proc/interrupts"
+	cap "$P" "cat /proc/softirqs"
+	cap "$P" "for i in /proc/irq/[0-9]*; do n=\${i##*/}; echo \"irq \$n \$(cat \$i/smp_affinity_list) \$(grep \"^ *\$n:\" /proc/interrupts | awk '{print \$NF}')\"; done"
+	cap "$P" "uci -q get network.@globals[0].packet_steering; uci -q get network.@globals[0].steering_flows"
+	cap "$P" "pgrep -l irqbalance; ps w | grep -E 'iperf|ksoftirq|napi' | grep -v grep"
+	cap "$P" "for f in netdev_budget netdev_budget_usecs dev_weight rps_sock_flow_entries netdev_max_backlog; do echo \$f=\$(cat /proc/sys/net/core/\$f); done"
+	cap "$P" "cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null"
+	cap "$P" "ls -l /usr/libexec/platform/packet-steering.sh"
+
+	FW=$S/firewall.txt
+	cap "$FW" "apk list -I firewall4 2>/dev/null || opkg list-installed firewall4"
+	have nft && cap "$FW" "nft list flowtables"
+
+	# the driver
+	D=$S/driver.txt
+	cap "$D" "cat /sys/kernel/debug/octeon_pip/*/status"
+	cap "$D" "for p in /sys/module/octeon_pip/parameters/*; do echo \${p##*/}=\$(cat \$p); done"
+	cap "$D" "dmesg | grep -iE 'octeon_pip|phylink|sfp|mdio|dsa|qca8k|mv88e6|rtl83|b53|mt753|link is|pcs'"
+
+	# the register maps of the DSA switches: the devices of the user ports
+	for d in /sys/class/net/*; do
+		[ "$(cat $d/iflink 2>/dev/null)" != "$(cat $d/ifindex 2>/dev/null)" ] || continue
+		sw=$(readlink -f "$d/device" 2>/dev/null); sw=${sw##*/}
+		[ -n "$sw" ] && echo "$sw"
+	done | sort -u | while read -r sw; do
+		for r in /sys/kernel/debug/regmap/"$sw"*; do
+			[ -r "$r/registers" ] || continue
+			head -c 262144 "$r/registers" > "$S/regmap-$(echo "${r##*/}" | tr ':/' '__').txt" 2>/dev/null
+		done
+	done
+
+	regs_now "$S"
+	conduit_check "$S"
+	mask "$S"/*.txt
+}
+
+# re-read now every register the kernel logged at boot, plus the parser
+# setup of each octeon_pip port: "name iface.index addr boot now"
+regs_now() {
+	S=$1; R=$S/regs.txt
+	if ! have devmem; then
+		echo "devmem missing: no live registers" > "$R"; return
+	fi
+	{
+		echo "# name iface.index address bootloader now"
+		grep -E '^[A-Z]' "$S/bootregs.txt" 2>/dev/null | while read -r name where addr boot; do
+			now=$(rd64 "$addr")
+			if [ "$now" = "?" ]; then mark=" UNREADABLE"
+			else
+				now=$(hex "$now")
+				if [ "$(hex "$boot")" != "$now" ]; then mark=" CHANGED"; else mark=; fi
+			fi
+			echo "$name $where $addr $(hex "$boot") $now$mark"
+		done
+		for d in $(opip_devs); do
+			port_info "$d"
+			[ "$ipd" = "?" ] && continue
+			for r in CFG:0x11800A0000200 TAG:0x11800A0000400; do
+				a=$(hex $((${r#*:} + ipd * 8)))
+				b=$(awk -v n="PIP_PRT_${r%%:*}" -v w="-1.$ipd" '$1 == n && $2 == w { print $4 }' "$S/bootregs.txt" 2>/dev/null)
+				echo "PIP_PRT_${r%%:*}($d) -1.$ipd $a ${b:-0} $(rd64 "$a")"
+			done
+		done
+	} > "$R"
+}
+
+# a DSA conduit's parser setup against what its tagger puts in front of
+# the IP header
+conduit_check() {
+	S=$1; C=$S/conduit.txt; : > "$C"
+	for d in $(opip_devs); do
+		[ -r "/sys/class/net/$d/dsa/tagging" ] || continue
+		tagger=$(cat "/sys/class/net/$d/dsa/tagging")
+		port_info "$d"
+		set -- $(tag_layout "$tagger")
+		len=$1 where=$2
+		cfg=?; skip=?; mode=?; dsa_en=?
+		if have devmem && [ "$ipd" != "?" ]; then
+			cfg=$(rd64 "$(pip_cfg_addr "$ipd")")
+			[ "$cfg" != "?" ] && { skip=$((cfg & 0x7f)); mode=$(((cfg >> 8) & 3)); dsa_en=$(((cfg >> 10) & 1)); }
+		fi
+		verdict=unchecked
+		if [ -z "$len" ]; then
+			verdict="tagger $tagger unknown to octeon-health"
+		elif [ "$len" = 0 ]; then
+			verdict="ok: no header in front of the IP header"
+		elif [ "$skip" = "?" ]; then
+			verdict="cannot read PIP_PRT_CFG (no devmem or no IPD port)"
+		elif [ "$skip" = "$len" ]; then
+			verdict="ok: SKIP $skip matches the $len-byte $where header"
+		else
+			verdict="MISMATCH: the $len-byte $where header hides the IP header from the parser (SKIP $skip, want $len): no rx checksum offload, no flow hash"
+		fi
+		echo "$d tagger=$tagger header=${len:-?}:${where:-?} iface=$iface.$index ipd=$ipd cfg=$cfg skip=$skip mode=$mode dsa_en=$dsa_en: $verdict" >> "$C"
+	done
+}
+
+# ---------------------------------------------------------------- benchmarks
+#
+# One list of tests, run one of two ways:
+#   pcserver  the PC runs "iperf3 -s", the router is the client
+#   pcclient  the PC takes no connections (firewall): the router runs one
+#             "iperf3 -s -1" per test, the PC one pasted loop of clients
+# A test line is "name|args|cpu|skip": args as the router's client uses them
+# (-R: the router receives), cpu the router iperf3's CPU or -, skip the PIP
+# SKIP of the conduit to the PC during the test or -.
+
+add_test() { echo "$1|$2|$3|$4" >> "$OUT/tests.lst"; }
+
+# the conduit to the PC, if its tagger hides the IP header from the parser:
+# SKIP_ADDR, SKIP_ORIG (PIP_PRT_CFG as booted), SKIP_WANT, SKIP_DEV
+skip_setup() {
+	SKIP_ADDR=
+	set -- $(peer_conduit)
+	SKIP_DEV=$1
+	[ -n "$SKIP_DEV" ] || { say "  the PC is not behind a DSA switch on octeon_pip: no SKIP test"; return; }
+	have devmem || { say "  no devmem: no SKIP test"; return; }
+	set -- $(tag_layout "$(cat /sys/class/net/$SKIP_DEV/dsa/tagging)")
+	[ -n "$1" ] && [ "$1" != 0 ] || { say "  the tagger of $SKIP_DEV needs no skip"; return; }
+	SKIP_WANT=$1
+	port_info "$SKIP_DEV"
+	[ "$ipd" != "?" ] || { say "  no IPD port for $SKIP_DEV (debugfs?): no SKIP test"; return; }
+	a=$(pip_cfg_addr "$ipd")
+	SKIP_ORIG=$(rd64 "$a")
+	[ "$SKIP_ORIG" != "?" ] || { say "  cannot read PIP_PRT_CFG of $SKIP_DEV: no SKIP test"; return; }
+	[ "$((SKIP_ORIG & 0x7f))" = "$SKIP_WANT" ] && { say "  $SKIP_DEV: SKIP already $SKIP_WANT"; return; }
+	SKIP_ADDR=$a
+	say "  $SKIP_DEV carries the PC's traffic: SKIP $((SKIP_ORIG & 0x7f)) as booted, its tagger wants $SKIP_WANT: A/B test added"
+}
+
+# set_skip VALUE: 1 when the link to the PC died with it (then restored)
+set_skip() {
+	[ "$1" = - ] || [ -z "$SKIP_ADDR" ] && return 0
+	devmem "$SKIP_ADDR" 64 $(((SKIP_ORIG & ~0x7f) | $1))
+	ping -c 2 -W 2 "$PEER" > /dev/null 2>&1 && return 0
+	devmem "$SKIP_ADDR" 64 "$SKIP_ORIG"
+	return 1
+}
+restore_skip() { [ -n "$SKIP_ADDR" ] && devmem "$SKIP_ADDR" 64 "$SKIP_ORIG"; }
+
+# the background helpers of the tests (CPU samplers, one-shot servers), so
+# that an interrupted run stops them: their pids in $BGP
+bg_add() { echo "$1" >> "$BGP"; }
+bg_del() { [ -f "$BGP" ] && grep -vx "$1" "$BGP" > "$BGP.n"; mv -f "$BGP.n" "$BGP" 2>/dev/null; }
+
+# undo what the tests changed and stop their helpers: at the end, and on
+# INT/TERM (HUP and PIPE are ignored: a lost ssh session must not stop the
+# run halfway)
+cleanup() {
+	restore_skip
+	[ -n "$l3" ] && fwd_cleanup
+	[ -s "$BGP" ] && kill $(cat "$BGP") 2>/dev/null
+	rm -f "$BGP" "$BGP.n"
+	# an interrupted test's files
+	rm -rf "$BASE/.run.$$"* "$BASE/.srv.$$"* "$BASE"/.[wfc].?
+}
+
+build_tests() {
+	: > "$OUT/tests.lst"
+	cpus=$(grep -c ^processor /proc/cpuinfo)
+	for t in "router sends (tx), 1 stream|" "router receives (rx), 1 stream|-R" \
+		 "router sends (tx), 4 streams|-P 4" "router receives (rx), 4 streams|-R -P 4"; do
+		i=0; while [ $i -lt "$N" ]; do i=$((i + 1)); add_test "${t%%|*}" "${t#*|}" - -; done
+	done
+	c=0
+	[ -n "$NOPIN" ] && c=$cpus
+	while [ "$cpus" -gt 1 ] && [ $c -lt "$cpus" ]; do
+		add_test "rx 1 stream, router iperf3 on cpu$c" "-R" $c -
+		add_test "tx 1 stream, router iperf3 on cpu$c" "" $c -
+		c=$((c + 1))
+	done
+	[ -n "$NOAB" ] && return
+	skip_setup
+	[ -n "$SKIP_ADDR" ] || return
+	o=$((SKIP_ORIG & 0x7f)); last=$((cpus - 1))
+	i=0
+	while [ $i -lt "$N" ]; do	# interleaved, so drift hits both alike
+		i=$((i + 1))
+		add_test "rx 1 stream, conduit SKIP $o (as booted)" "-R" - "$o"
+		add_test "rx 1 stream, conduit SKIP $SKIP_WANT" "-R" - "$SKIP_WANT"
+		[ "$cpus" -gt 1 ] || continue
+		add_test "rx 1 stream, conduit SKIP $o, router iperf3 on cpu$last" "-R" $last "$o"
+		add_test "rx 1 stream, conduit SKIP $SKIP_WANT, router iperf3 on cpu$last" "-R" $last "$SKIP_WANT"
+	done
+}
+
+# parse JSON A B: "Mbit/s retrans cpu..." from an iperf3 result and two
+# CPU snapshots
+result() {
+	bps=$(echo "$1" | jsonfilter -e '@.end.sum_received.bits_per_second' 2>/dev/null)
+	# a sending server's own result has nothing received: take what it sent
+	case "$bps" in 0|0.0*|"")
+		sent=$(echo "$1" | jsonfilter -e '@.end.sum_sent.bits_per_second' 2>/dev/null)
+		[ -n "$sent" ] && bps=$sent ;;
+	esac
+	rtr=$(echo "$1" | jsonfilter -e '@.end.sum_sent.retransmits' 2>/dev/null)
+	err=$(echo "$1" | jsonfilter -e '@.error' 2>/dev/null)
+	if [ -z "$bps" ]; then echo "FAIL ${err:-no result}"; return; fi
+	cpu="cpu n/a"; [ -f "$2" ] && [ -f "$3" ] && cpu=$(cpu_delta "$2" "$3")
+	echo "$(awk -v b="$bps" 'BEGIN { printf "%d", b / 1e6 }') ${rtr:-0} $cpu"
+}
+
+# bg_wait PID: wait for a helper a second at a time, so that a TERM's trap
+# runs within a second (ash runs traps only between commands)
+bg_wait() { while kill -0 "$1" 2>/dev/null; do sleep 1; done; bg_del "$1"; }
+
+# the router as the client: run_pcserver ARGS CPU; the result in $r. Runs
+# in the main shell, not in $(...), so that a TERM stops it at once
+run_pcserver() {
+	tmp=$BASE/.run.$$
+	pin=; [ "$2" != - ] && pin="-A $2"
+	(sleep 2; cpu_snap "$tmp.a"; sleep $((T - 4)); cpu_snap "$tmp.b") &
+	sampler=$!; bg_add $sampler
+	iperf3 -J --connect-timeout 3000 -c "$PEER" ${PORT:+-p $PORT} -t "$T" $1 $pin > "$tmp.json" 2>&1 &
+	cli=$!; bg_add $cli
+	bg_wait $cli; bg_wait $sampler
+	r=$(result "$(cat "$tmp.json")" "$tmp.a" "$tmp.b")
+	rm -f "$tmp.a" "$tmp.b" "$tmp.json"
+}
+
+# the router as a one-shot server, CPU snapshots once a second; the
+# window is taken from the test's own start time: run_pcclient ARGS CPU WAIT
+# (WAIT: seconds for the PC's client to come); the result in $r
+run_pcclient() {
+	tmp=$BASE/.srv.$$; rm -rf "$tmp.d"; mkdir -p "$tmp.d"
+	pin=; [ "$2" != - ] && have taskset && pin="taskset -c $2"
+	$pin timeout "$3" iperf3 -s -1 -J ${PORT:+-p $PORT} > "$tmp.json" 2>&1 &
+	srv=$!; bg_add $srv
+	while kill -0 $srv 2>/dev/null; do cpu_snap "$tmp.d/$(date +%s)"; sleep 1; done
+	bg_del $srv
+	json=$(cat "$tmp.json")
+	start=$(echo "$json" | jsonfilter -e '@.start.timestamp.timesecs' 2>/dev/null)
+	if [ -z "$start" ]; then
+		# timeout's TERM makes iperf3 write "interrupt - the server has
+		# terminated": no client came; a port in use ends it at once
+		err=$(echo "$json" | jsonfilter -e '@.error' 2>/dev/null)
+		case "$err" in
+		""|*terminated*|*interrupt*) r="FAIL no client connected" ;;
+		*"unable to start listener"*|*"in use"*) r="FAIL router server: $err" ;;
+		*) r="FAIL $err" ;;
+		esac
+		rm -rf "$tmp.d" "$tmp.json"; return
+	fi
+	a=$(ls "$tmp.d" | sort -n | awk -v t=$((start + 2)) '$1 >= t { print; exit }')
+	b=$(ls "$tmp.d" | sort -n | awk -v t=$((start + T - 2)) '$1 <= t { x = $1 } END { print x }')
+	r=$(result "$json" "$tmp.d/$a" "$tmp.d/$b")
+	rm -rf "$tmp.d" "$tmp.json"
+}
+
+# the PC's loop for pcclient: the tests' directions mirrored (the router's
+# -R is the PC sending)
+pc_loop() {
+	me=$(ip route get "$PEER" | sed -n 's/.* src \([^ ]*\).*/\1/p')
+	sh_list=; ps_list=
+	while IFS='|' read -r name args cpu skip; do
+		case "$args" in -R*) m=${args#-R}; m=${m# } ;; *) m="-R${args:+ $args}" ;; esac
+		sh_list="$sh_list \"$m\""
+		ps_list="$ps_list${ps_list:+,}\"$m\""
+	done < "$OUT/tests.lst"
+	tell <<-EOF
+
+	Paste this on the PC (Linux, macOS; one line), after you pressed Enter here:
+
+	  for a in$sh_list; do for i in 1 2 3 4 5 6; do iperf3 -c $me ${PORT:+-p $PORT} -t $T \$a && break; sleep 1; done; sleep 2; done
+
+	Windows PowerShell instead:
+
+	  foreach (\$a in @($ps_list)) { for (\$i = 0; \$i -lt 6; \$i++) { iperf3.exe -c $me ${PORT:+-p $PORT} -t $T (\$a -split ' ' | ? { \$_ }); if (\$LASTEXITCODE -eq 0) { break }; Start-Sleep 1 }; Start-Sleep 2 }
+
+	It runs $(wc -l < "$OUT/tests.lst") tests of $T s, about $(( $(wc -l < "$OUT/tests.lst") * (T + 3) / 60 + 1 )) minutes.
+	EOF
+}
+
+run_tests() {	# MODE
+	build_tests
+	n=$(wc -l < "$OUT/tests.lst")
+	hdr "Benchmarks with $PEER, $1: $n tests of $T s"
+	[ "$1" = pcclient ] && { pc_loop; pause "Press Enter, then start the loop on the PC."; }
+	: > "$OUT/bench.txt"
+	k=0
+	while IFS='|' read -r name args cpu skip <&3; do
+		k=$((k + 1))
+		if ! set_skip "$skip"; then
+			r="FAIL SKIP $skip broke the link to the PC"
+			# the PC's loop runs this test anyway: take its client, so that
+			# the next test gets the next client
+			if [ "$1" = pcclient ]; then
+				timeout $((T + 60)) iperf3 -s -1 ${PORT:+-p $PORT} > /dev/null 2>&1 &
+				sink=$!; bg_add $sink; bg_wait $sink
+			fi
+		elif [ "$1" = pcclient ]; then
+			# the first test waits for the tester to paste the loop
+			wait_s=$((T + 60)); [ $k = 1 ] && wait_s=$((T + 300))
+			run_pcclient "$args" "$cpu" "$wait_s"
+		else
+			run_pcserver "$args" "$cpu"
+		fi
+		restore_skip
+		echo "$name|$r" >> "$OUT/bench.txt"
+		case "$r" in
+		FAIL*) say "  [$k/$n] $name: $r" ;;
+		*) say "  [$k/$n] $name: ${r%% *} Mbit/s  cpu(busy/softirq%): ${r#* * }" ;;
+		esac
+		case "$r" in
+		"FAIL no client connected")
+			say "  the PC's loop does not run: the remaining tests are skipped"; break ;;
+		"FAIL router server:"*)
+			say "  the router's iperf3 server cannot start (another iperf3 on port ${PORT:-5201}? try PORT=...): the remaining tests are skipped"; break ;;
+		esac
+	done 3< "$OUT/tests.lst"
+	# median per test, in the order of the list
+	{
+		echo "| test | median Mbit/s | runs | router CPU busy/softirq % (last run) |"
+		echo "|---|---|---|---|"
+		awk -F'|' '{ if (!($1 in n)) o[++k] = $1; split($2, f, " ")
+			if (f[1] != "FAIL") { v[$1, ++n[$1]] = f[1]; c[$1] = substr($2, index($2, "cpu")) }
+			else if (!($1 in n)) n[$1] = 0 }
+		END { for (i = 1; i <= k; i++) { t = o[i]; m = n[t]; s = ""
+			for (j = 1; j <= m; j++) { a[j] = v[t, j]; s = s " " v[t, j] }
+			for (x = 1; x <= m; x++) for (y = x + 1; y <= m; y++) if (a[y] < a[x]) { z = a[x]; a[x] = a[y]; a[y] = z }
+			printf "| %s | %s |%s | %s |\n", t, m ? a[int((m + 1) / 2)] : "-", s, c[t] } }' "$OUT/bench.txt"
+	} > "$OUT/bench-table.md"
+}
+
+# which octeon_pip conduit carries the traffic to the PC, if any: "conduit port"
+peer_conduit() {
+	via=$(ip route get "$PEER" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+	mac=$(ip neigh show "$PEER" | awk '{ for (i = 1; i < NF; i++) if ($i == "lladdr") print $(i + 1) }')
+	port=$via
+	if [ -d "/sys/class/net/$via/bridge" ] && [ -n "$mac" ] && have bridge; then
+		port=$(bridge fdb show br "$via" | awk -v m="$mac" 'tolower($1) == tolower(m) && $2 == "dev" { print $3; exit }')
+	fi
+	[ -n "$port" ] || return
+	link=$(cat "/sys/class/net/$port/iflink" 2>/dev/null)
+	for d in $(opip_devs); do
+		[ "$(cat /sys/class/net/$d/ifindex)" = "$link" ] && [ -r "/sys/class/net/$d/dsa/tagging" ] && { echo "$d $port"; return; }
+	done
+}
+
+# undo the namespace setup: the address only if the script added it
+fwd_cleanup() {
+	[ -n "$fwd_added" ] && ip addr del "$NETNS_NET.1/24" dev "$l3" 2>/dev/null
+	[ -n "$sr_all" ] && echo "$sr_all" > /proc/sys/net/ipv4/conf/all/send_redirects
+	[ -n "$sr_dev" ] && echo "$sr_dev" > "/proc/sys/net/ipv4/conf/$l3/send_redirects"
+	l3= fwd_added= sr_all= sr_dev=
+}
+
+# wait_traffic: wait up to 30 s until the octeon_pip ports forward at least
+# 8 Mbit/s; 1 when nothing came
+wait_traffic() {
+	i=0
+	net_snap "$BASE/.w.a"
+	while [ $i -lt 30 ]; do
+		i=$((i + 1)); sleep 1
+		net_snap "$BASE/.w.b"
+		set -- $(net_delta "$BASE/.w.a" "$BASE/.w.b" 1)
+		[ "${2:-0}" -ge 8 ] && { rm -f "$BASE"/.w.?; return 0; }
+		mv -f "$BASE/.w.b" "$BASE/.w.a"
+	done
+	rm -f "$BASE"/.w.?
+	return 1
+}
+
+# forwarding: the PC's second NIC in a network namespace behind the router,
+# or FWD_PEER, a server the router already routes to
+bench_forward() {
+	hdr "Forwarding test"
+	l3=
+	if [ -n "$FWD_PEER" ]; then
+		target=$FWD_PEER
+	else
+		ask "Does your PC have a second Ethernet port you can plug into another router port? (y/n)" n
+		case "$ans" in y*|Y*) ;; *) say "  skipped"; return ;; esac
+		target=$NETNS_NET.2
+		l3=$(ip route get "$PEER" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+		me=$(ip route get "$PEER" 2>/dev/null | sed -n 's/.* src \([^ ]*\).*/\1/p')
+		[ -n "$l3" ] && [ -n "$me" ] || { say "  no route to $PEER: skipped"; l3=; return; }
+		fwd_added=
+		ip -4 addr show dev "$l3" | grep -q " $NETNS_NET.1/" ||
+			{ ip addr add "$NETNS_NET.1/24" dev "$l3" 2>/dev/null && fwd_added=1; }
+		# the router forwards back out of the interface the PC sends on: its
+		# ICMP redirects would send the PC around it, straight to the
+		# namespace on the same LAN (both knobs are ORed)
+		sr_all=$(cat /proc/sys/net/ipv4/conf/all/send_redirects)
+		sr_dev=$(cat "/proc/sys/net/ipv4/conf/$l3/send_redirects")
+		echo 0 > /proc/sys/net/ipv4/conf/all/send_redirects
+		echo 0 > "/proc/sys/net/ipv4/conf/$l3/send_redirects"
+		tell <<-EOF
+
+		Plug the second port of your PC into any other LAN port of the router, then run
+		on the PC (replace NIC2 with that port's name, see 'ip -br link'):
+
+		  sudo ip netns add ohc
+		  sudo ip link set NIC2 netns ohc
+		  sudo ip -n ohc addr add $NETNS_NET.2/24 dev NIC2
+		  sudo ip -n ohc link set NIC2 up
+		  sudo ip -n ohc route add default via $NETNS_NET.1
+		  sudo ip netns exec ohc iperf3 -s -D ${PORT:+-p $PORT}
+		  sudo ip route add $NETNS_NET.0/24 via $me
+
+		'ip route get $NETNS_NET.2' on the PC must show 'via $me' (a VPN or a second
+		default route can steal it).
+		EOF
+		pause "Press Enter when the server in the namespace runs."
+	fi
+	if ! ping -c 2 -W 2 "$target" > /dev/null 2>&1; then
+		say "  $target does not answer: skipped"
+		fwd_cleanup; return
+	fi
+	echo "| forwarding test (router MAC counters, all octeon_pip ports) | rx / tx Mbit/s | rx / tx kpps | router CPU busy/softirq % |" > "$OUT/fwd-table.md"
+	echo "|---|---|---|---|" >> "$OUT/fwd-table.md"
+	mkdir -p "$OUT/fwd"; : > "$OUT/fwd-diag.md"
+	dmesg | grep -cE 'transmit queue .* (stopped|timed out)' > "$OUT/fwd/txstop.0"
+	w=$((T * 3))
+	for dir in "" "-R" "-P 4" "-R -P 4"; do
+		r=$(echo "${dir:-plain}" | tr -d ' -')
+		offload_flows "$target" > "$OUT/fwd/$r-offload.0"
+		tell <<-EOF
+
+		On the PC, run now:   iperf3 -c $target ${PORT:+-p $PORT} -t $((w + 15)) $dir
+		EOF
+		pause "Press Enter when it runs."
+		# the window starts with the traffic, not with Enter
+		if ! wait_traffic; then
+			say "  forward iperf3 ${dir:-(PC -> $target)}: no traffic within 30 s: skipped"
+			echo "| PC iperf3 -c $target $dir | no traffic | - | - |" >> "$OUT/fwd-table.md"
+			continue
+		fi
+		# the PIP queues 2 to 5 s in, then the flow's conntrack entries
+		(sleep 2; i=0
+		 while [ $i -lt 4 ]; do
+			i=$((i + 1)); echo "# sample $i"
+			grep -h -E "queues|pko words" /sys/kernel/debug/octeon_pip/*/status 2>/dev/null
+			[ $i -lt 4 ] && sleep 1
+		 done
+		 offload_flows "$target" > "$OUT/fwd/$r-offload.1") > "$OUT/fwd/$r-pip.txt" &
+		sampler=$!; bg_add $sampler
+		sleep 3
+		fwd_snap "$r" a
+		net_snap "$BASE/.f.a"; cpu_snap "$BASE/.c.a"
+		sleep "$w"
+		net_snap "$BASE/.f.b"; cpu_snap "$BASE/.c.b"
+		fwd_snap "$r" b
+		# still traffic after the window? If not, the client ended inside it
+		sleep 1; net_snap "$BASE/.f.c"
+		set -- $(net_delta "$BASE/.f.b" "$BASE/.f.c" 1)
+		ended=; [ "${2:-0}" -ge 8 ] || ended=" (traffic ended before the window closed: too low)"
+		bg_wait $sampler
+		fwd_diag "$r" "$dir" > "$OUT/fwd/$r-diag.md"
+		cat "$OUT/fwd/$r-diag.md" >> "$OUT/fwd-diag.md"
+		grep '^WARNING' "$OUT/fwd/$r-diag.md" | while read -r l; do say "  $l"; done
+		set -- $(net_delta "$BASE/.f.a" "$BASE/.f.b" "$w")
+		c=$(cpu_delta "$BASE/.c.a" "$BASE/.c.b")
+		say "  forward iperf3 ${dir:-(PC -> $target)}: rx $2 tx $5 Mbit/s, rx $8 tx ${11} kpps  cpu(busy/softirq%): $c$ended"
+		echo "forward|${dir:-plain}|rx $2 tx $5 Mbit/s rx $8 tx ${11} kpps$ended|$c" >> "$OUT/bench.txt"
+		echo "| PC iperf3 -c $target $dir | $2 / $5$ended | $8 / ${11} | $c |" >> "$OUT/fwd-table.md"
+		# the client started at the latest when the traffic came, so it ends
+		# at most 12 s after the window
+		sleep 12
+	done
+	rm -f "$BASE"/.f.? "$BASE"/.c.?
+	if [ -n "$l3" ]; then
+		fwd_cleanup
+		tell <<-EOF
+
+		Done. Clean up on the PC:  sudo ip netns del ohc; sudo ip route del $NETNS_NET.0/24
+		EOF
+	fi
+}
+
+# ---------------------------------------------------------------- report
+
+summary() {
+	S=$OUT/snapshot M=$OUT/summary.md
+	{
+		echo "## OCTEON health report"
+		echo
+		echo "- board: $(cat /tmp/sysinfo/board_name 2>/dev/null) ($(cat /tmp/sysinfo/model 2>/dev/null))"
+		echo "- kernel: $(uname -r) $(uname -v)"
+		echo "- image: $(. /etc/openwrt_release; echo "$DISTRIB_DESCRIPTION")"
+		echo "- cpu: $(grep -m1 'cpu model' /proc/cpuinfo | cut -d: -f2-), $(grep -c ^processor /proc/cpuinfo) cores"
+		echo "- chip: PRId $(sed -n 's/.*CPU0 revision is: \([0-9a-f]*\).*/\1/p' "$S/dmesg.txt" | head -1)"
+		if [ "$(date +%Y)" -lt 2024 ]; then when="uptime $(cut -d. -f1 /proc/uptime) s (clock not set)"
+		else when=$(date); fi
+		echo "- report: octeon-health v$VERSION, $when"
+		echo
+		echo "### Ports"
+		echo "| dev | iface.index | ipd | link | driver | notes |"
+		echo "|---|---|---|---|---|---|"
+		for d in /sys/class/net/*; do
+			n=${d##*/}; [ -e "$d/device" ] || continue
+			drv=$(readlink "$d/device/driver"); drv=${drv##*/}
+			note=; [ -r "$d/dsa/tagging" ] && note="DSA conduit, tagger $(cat $d/dsa/tagging)"
+			link=$(cat $d/iflink); [ "$link" != "$(cat $d/ifindex)" ] && note="DSA user port"
+			if [ "$drv" = octeon_pip ]; then port_info "$n"; else iface=-; index=-; ipd=-; fi
+			at="$iface.$index"
+			[ "$at" = "?.?" ] && { at=-; note="${note:+$note, }no DT node"; }
+			sp=$(cat $d/speed 2>/dev/null); car=$(cat $d/carrier 2>/dev/null)
+			case "$car:$sp" in
+			1:-1|1:) lk=up ;;
+			1:*) lk="up $sp" ;;
+			*) lk=down ;;
+			esac
+			echo "| $n | $at | $ipd | $lk | $drv | $note |"
+		done
+		echo
+		if [ -s "$S/conduit.txt" ]; then
+			echo "### DSA conduits: parser skip"
+			sed 's/^/- /' "$S/conduit.txt"
+			echo
+		fi
+		echo "### Pinning"
+		echo '```'
+		awk '/octeon_pip/' "$S/pinning.txt" | head -20
+		ps=$(uci -q get network.@globals[0].packet_steering)
+		echo "packet_steering: ${ps:-unset (on by default, unless the target overrides it)}"
+		# the rx queues with rps_cpus set: "dev/rx-N=mask", octeon_pip ports apart
+		pips=" $(opip_devs | tr '\n' ' ') "
+		prps= orps=
+		for f in "$S"/ethtool-*.txt; do
+			d=${f##*/ethtool-}; d=${d%.txt}
+			q=$(sed -n 's|^/sys/class/net/\([^/]*\)/queues/\(rx-[0-9]*\) rps=\([^ ]*\).*|\1/\2=\3|p' "$f" | grep -v '=[0,]*$' | tr '\n' ' ')
+			[ -n "$q" ] || continue
+			case "$pips" in *" $d "*) prps="$prps$q" ;; *) orps="$orps$q" ;; esac
+		done
+		[ -n "$prps" ] && echo "WARNING: RPS on octeon_pip queues (packet_steering=${ps:-unset}): $prps"
+		[ -n "$orps" ] && echo "RPS on other devices: $orps"
+		[ -z "$prps$orps" ] && echo "RPS: no queue has rps_cpus set"
+		if grep -q '^[-l].*packet-steering.sh' "$S/pinning.txt" 2>/dev/null; then
+			echo "packet-steering override: /usr/libexec/platform/packet-steering.sh present"
+		else
+			echo "packet-steering override: /usr/libexec/platform/packet-steering.sh missing: old rootfs without the octeon packet-steering override"
+		fi
+		echo '```'
+		echo
+		echo "### Firewall"
+		echo '```'
+		if [ -r "$S/firewall.txt" ]; then
+			fw=$(awk '/^### / { s = ($0 ~ /^### apk list/); next } s && NF' "$S/firewall.txt")
+			case "$fw" in
+			"") echo "firewall4: not installed" ;;
+			*"not found"*) echo "firewall4: no package manager (apk, opkg)" ;;
+			*) echo "firewall4: $fw" ;;
+			esac
+			if grep -q '^### nft' "$S/firewall.txt"; then
+				ft=$(awk '/^### / { s = ($0 ~ /^### nft/); next } s' "$S/firewall.txt" | grep -E 'flowtable|hook|devices|flags|^Error')
+				echo "${ft:-flowtables: none}"
+			else
+				echo "flowtables: nft missing"
+			fi
+		else
+			echo "(no firewall capture in this snapshot)"
+		fi
+		echo '```'
+		echo
+		if [ -s "$OUT/bench-table.md" ]; then
+			echo "### Benchmarks (PC $PEER)"
+			cat "$OUT/bench-table.md"
+			echo
+		fi
+		if [ -s "$OUT/fwd-table.md" ]; then
+			cat "$OUT/fwd-table.md"
+			echo
+		fi
+		if [ -s "$OUT/fwd-diag.md" ]; then
+			echo "### Forwarding diagnostics"
+			cat "$OUT/fwd-diag.md"
+			n=$(dmesg | grep -cE 'transmit queue .* (stopped|timed out)')
+			echo "dmesg 'transmit queue ... stopped|timed out': $n since boot, $((n - $(cat "$OUT/fwd/txstop.0" 2>/dev/null || echo 0))) during the forwarding test"
+			echo
+		fi
+		echo "### Registers changed since the bootloader"
+		echo '```'
+		# status and interrupt registers always differ: names only
+		st='^(PCS_INT|PCS_MR_STATUS|PCS_AN_RESULTS|PCS_AN_LP_ABIL|GMX_RX_INT_REG|GMX_TX_INT_REG|[A-Z0-9_]*_INT(_REG)?) '
+		grep CHANGED "$S/regs.txt" 2>/dev/null | grep -vE "$st" > "$S/.chg"
+		head -40 "$S/.chg"
+		[ "$(wc -l < "$S/.chg")" -gt 40 ] && echo "($(($(wc -l < "$S/.chg") - 40)) more in snapshot/regs.txt)"
+		rm -f "$S/.chg"
+		grep CHANGED "$S/regs.txt" 2>/dev/null | grep -E "$st" |
+			awk '{ w[$1] = w[$1] " " $2 } END { for (r in w) printf "%s%s", (n++ ? ", " : "status/interrupt (expected): "), r "(" substr(w[r], 2) ")"; if (n) print "" }'
+		[ -s "$S/bootregs.txt" ] || echo "(no octeon-bootregs lines: not a test kernel, or dmesg wrapped)"
+		echo '```'
+		echo
+		echo "### Non-zero error counters"
+		echo '```'
+		grep -hiE '^ +[a-z0-9_-]*(err|drop|fifo|over|crc|fcs|framecheck|jabber|align|nxa|no_|fail|timeout|lost|symbol|undersize|fragment)[a-z0-9_-]*: [1-9]' "$S"/ethtool-*.txt 2>/dev/null | head -30
+		echo '```'
+		echo
+		echo "### Kernel warnings"
+		echo '```'
+		grep -iE 'warn|error|fail|oops|(^|[^a-z])bug([^a-z]|$)|call trace|timeout|stopped' "$S/dmesg.txt" | grep -v octeon-bootregs | head -30
+		echo '```'
+	} > "$M"
+}
+
+pack() {
+	mask "$OUT"/*.md "$OUT"/*.txt "$OUT"/fwd/*.md
+	cat > "$OUT/CONTENTS.txt" <<-EOF
+	octeon-health v$VERSION report
+	summary.md     the summary to paste into the GitHub comment
+	log.txt        what the run printed
+	bench*.md/txt  benchmark results; fwd-*.md and fwd/ the forwarding test
+	               (softnet_stat, tc qdisc, PIP queue samples, conntrack offload)
+	snapshot/      system, dmesg, logread, network, ethtool per port, pinning,
+	               firewall, driver debugfs, registers, device tree
+	../boot/       the same snapshot taken right after boot
+	Masked: MAC addresses past their OUI, public IPv4 and global IPv6
+	addresses, DHCP log lines, uci keys/passwords/usernames, SFP serials, the
+	device tree's MAC addresses. Not masked: private addresses (10/8,
+	172.16/12, 192.168/16), hostnames in uname/board info.
+	EOF
+	tar -C "$BASE" -czf "$OUT.tar.gz" "${OUT##*/}" "boot" 2>/dev/null ||
+		tar -C "$BASE" -czf "$OUT.tar.gz" "${OUT##*/}"
+	ip=$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+	cat <<-EOF
+
+	Report: $OUT.tar.gz ($(du -k "$OUT.tar.gz" | cut -f1) KiB)
+	Get it from your PC:   scp -O root@${ip:-192.168.1.1}:$OUT.tar.gz .
+	Attach the .tar.gz to the GitHub thread and paste summary.md (below) into the comment.
+
+	EOF
+}
+
+# ---------------------------------------------------------------- main
+
+# board and time for the file names; the uptime when the clock never got set
+stamp() {
+	b=$(cat /tmp/sysinfo/board_name 2>/dev/null | tr ',/' '--')
+	if [ "$(date +%Y)" -lt 2024 ]; then t=up$(cut -d. -f1 /proc/uptime)s
+	else t=$(date +%Y%m%d-%H%M%S); fi
+	echo "octeon-health-${b:-unknown}-$t"
+}
+
+mkdir -p "$BASE"
+case "$1" in
+boot)
+	OUT=$BASE/boot LOG=
+	snapshot "$OUT/snapshot" > /dev/null 2>&1
+	echo "octeon-health: boot snapshot in $OUT; run 'octeon-health' for the report" > /dev/console
+	exit 0 ;;
+snapshot)
+	OUT=$BASE/$(stamp) LOG=$OUT/log.txt
+	mkdir -p "$OUT"; NONINTERACTIVE=1
+	snapshot "$OUT/snapshot"; summary; pack; cat "$OUT/summary.md"
+	exit 0 ;;
+esac
+
+[ -t 0 ] || NONINTERACTIVE=1
+OUT=$BASE/$(stamp) LOG=$OUT/log.txt
+mkdir -p "$OUT"
+BGP=$BASE/.bg.$$; : > "$BGP"
+# a test may cut the ssh session: finish and restore anyway; Ctrl-C and
+# kill restore too
+trap '' HUP PIPE
+trap 'cleanup' EXIT
+trap 'cleanup; exit 130' INT TERM
+
+hdr "octeon-health v$VERSION"
+for t in iperf3 ethtool devmem jsonfilter; do have $t || say "  missing tool: $t (some parts are skipped)"; done
+[ -s "$BASE/boot/snapshot/bootregs.txt" ] || say "  no bootloader register log (octeon-bootregs) in this kernel's dmesg"
+
+hdr "Snapshot"
+snapshot "$OUT/snapshot"
+say "  done"
+
+pc=${SSH_CLIENT%% *}
+ask "IP address of your PC (for iperf3)" "${PEER:-${pc:-skip}}"
+PEER=$ans
+if [ "$PEER" != skip ] && ip route get "$PEER" 2>/dev/null | grep -q '^local'; then
+	say "  $PEER is an address of the router itself: benchmarks skipped"; PEER=skip
+fi
+# can the router reach the PC's iperf3 server? Without a terminal, give it
+# 20 s to come up
+probe() {
+	i=0
+	while ! iperf3 --connect-timeout 3000 -c "$PEER" ${PORT:+-p $PORT} -t 1 > /dev/null 2>&1; do
+		[ -n "$NONINTERACTIVE" ] && [ $i -lt 10 ] || return 1
+		i=$((i + 1)); sleep 2
+	done
+}
+
+if [ "$PEER" = skip ] || [ -n "$NOBENCH" ]; then
+	:
+elif ! have iperf3 || ! have jsonfilter; then
+	say "  benchmarks skipped: iperf3 or jsonfilter missing"
+else
+	tell <<-EOF
+
+	On your PC, start an iperf3 server and leave it running:   iperf3 -s ${PORT:+-p $PORT}
+	(Linux, macOS and Windows builds: https://iperf.fr/iperf-download.php)
+	EOF
+	pause "Press Enter when it runs."
+	if [ "$MODE" != pcclient ] && probe; then
+		run_tests pcserver
+	else
+		[ "$MODE" = pcclient ] || say "  cannot reach iperf3 on $PEER:${PORT:-5201} (a firewall on the PC?)"
+		# without a terminal nobody pastes the loop: only when asked for
+		d=y; [ -n "$NONINTERACTIVE" ] && d=n; [ "$MODE" = pcclient ] && d=y
+		ask "Run it the other way round: the router is the server, you paste one loop on the PC? (y/n)" $d
+		case "$ans" in y*|Y*) run_tests pcclient ;; *) say "  benchmarks skipped" ;; esac
+	fi
+fi
+# the forwarding test needs no iperf3 on the router; the namespace setup
+# needs the PC's address
+if [ -z "$NOFWD" ] && { [ -n "$FWD_PEER" ] || [ "$PEER" != skip ]; }; then
+	bench_forward
+fi
+
+hdr "Report"
+regs_now "$OUT/snapshot"	# again, after the tests
+summary
+pack
+cat "$OUT/summary.md"
