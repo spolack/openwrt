@@ -1,0 +1,505 @@
+name: octeon-health images
+
+on:
+  push:
+    branches:
+      - octeon-health
+  workflow_dispatch:
+    inputs:
+      prebuilt:
+        description: 'Host tools and toolchain. auto: upstream toolchain container, else tools container plus snapshot toolchain, else build the tools. snapshot: skip the toolchain container. none: build the host tools here.'
+        type: choice
+        options:
+          - auto
+          - snapshot
+          - none
+        default: auto
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Fallback toolchain, used when the upstream toolchain container is not usable.
+  # Must match the tree's default GCC (toolchain/gcc/Config.version) and musl.
+  SNAPSHOT_URL: https://downloads.openwrt.org/snapshots/targets/octeon/generic
+  TOOLCHAIN_FILE: openwrt-toolchain-octeon-generic_gcc-14.4.0_musl.Linux-x86_64.tar.zst
+  # Upstream container tag: "latest" for main, openwrt-NN.NN for a release branch
+  # (see "Determine container name" in the reusable_build.yml of openwrt/actions-shared-workflows).
+  CONTAINER_TAG: latest
+  PREBUILT: ${{ inputs.prebuilt || 'auto' }}
+  FRAGMENT: .github/octeon-health/testkit.config
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    # a new push cancels a running build; the publish job has its own group
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-build
+      cancel-in-progress: true
+    outputs:
+      toolchain: ${{ steps.prebuilt.outputs.desc }}
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - name: Free disk space
+        run: |
+          for d in /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                   /usr/local/share/boost /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY"; do
+            sudo rm -rf "$d" &
+          done
+          { sudo docker image prune --all --force || true; } &
+          wait
+          df -h /
+
+      - name: Install build prerequisites
+        run: |
+          # The host tools come prebuilt, the runner only needs what the build system checks
+          # for (include/prereq-build.mk) and what the package builds call. ubuntu-latest has
+          # most of it; only install what is missing, so that apt is usually not run at all.
+          # (clang, gcc-multilib, g++-multilib and swig of the old list are not needed for
+          # octeon/generic; ccache comes with the tools.)
+          want="build-essential flex bison g++ gawk gettext git libncurses-dev libssl-dev \
+                python3-setuptools rsync unzip zlib1g-dev file wget zstd jq"
+          missing=$(for p in $want; do dpkg -s "$p" >/dev/null 2>&1 || echo "$p"; done)
+          if [ -n "$missing" ]; then
+            echo "installing: $missing"
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends $missing
+          fi
+
+      # Full history, without file contents: scripts/getver.sh counts commits for the
+      # revision, and the ccache step below looks up the toolchain's commit.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Check the config fragment exists
+        run: test -s "$FRAGMENT"
+
+      - name: Restore dl/ cache
+        uses: actions/cache/restore@v4
+        with:
+          path: dl
+          key: dl-${{ hashFiles('package/**/Makefile', '!package/feeds/**', 'toolchain/**/Makefile', 'tools/**/Makefile', 'target/linux/octeon/Makefile', 'include/kernel-6.18', 'feeds.conf.default') }}-${{ github.run_id }}
+          restore-keys: |
+            dl-${{ hashFiles('package/**/Makefile', '!package/feeds/**', 'toolchain/**/Makefile', 'tools/**/Makefile', 'target/linux/octeon/Makefile', 'include/kernel-6.18', 'feeds.conf.default') }}-
+            dl-
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-octeon-${{ hashFiles('toolchain/**', 'target/linux/octeon/**', 'target/linux/generic/**', 'include/kernel-6.18', 'package/**/Makefile', '!package/feeds/**') }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-octeon-${{ hashFiles('toolchain/**', 'target/linux/octeon/**', 'target/linux/generic/**', 'include/kernel-6.18', 'package/**/Makefile', '!package/feeds/**') }}-
+            ccache-octeon-
+
+      - name: Fetch the prebuilt tools and toolchain
+        id: prebuilt
+        run: |
+          tools_image=ghcr.io/openwrt/tools:$CONTAINER_TAG
+          toolchain_image=ghcr.io/openwrt/toolchain:octeon-generic-$CONTAINER_TAG
+          tools=build
+          toolchain=snapshot
+          image_ref=
+
+          # Copy directories out of an image to the same absolute path on the runner
+          # (/prebuilt_tools, /external-toolchain), so that paths recorded inside them
+          # still resolve. docker create + docker cp: the image is never started.
+          extract() { # image dir...
+            local image=$1 cid dir
+            shift
+            docker pull --quiet "$image" >/dev/null || return 1
+            image_ref=$(docker image inspect --format '{{index .RepoDigests 0}}' "$image" 2>/dev/null || echo "$image")
+            cid=$(docker create "$image" true) || return 1
+            for dir in "$@"; do
+              sudo rm -rf "$dir"
+              sudo install -d -o "$(id -u)" -g "$(id -g)" "$dir" || return 1
+              docker cp "$cid:$dir/." "$dir/" || { docker rm "$cid" >/dev/null; return 1; }
+            done
+            docker rm "$cid" >/dev/null
+            docker image rm --force "$image" >/dev/null 2>&1 || true
+          }
+
+          snapshot_toolchain() (
+            set -e
+            mkdir -p "$HOME/tc"
+            cd "$HOME/tc"
+            curl -fsSL "$SNAPSHOT_URL/sha256sums" | grep -F " *$TOOLCHAIN_FILE" > toolchain.sha256
+            test -s toolchain.sha256
+            curl -fsSL -O "$SNAPSHOT_URL/$TOOLCHAIN_FILE"
+            sha256sum -c toolchain.sha256
+            zstd -dc "$TOOLCHAIN_FILE" | tar -x
+            rm "$TOOLCHAIN_FILE"
+          )
+
+          if [ "$PREBUILT" = auto ]; then
+            if extract "$toolchain_image" /prebuilt_tools /external-toolchain; then
+              tools=prebuilt
+              toolchain=container
+            else
+              echo "::warning title=toolchain container::$toolchain_image is not usable, falling back to the tools container and the snapshot toolchain"
+            fi
+          fi
+          if [ "$tools" = build ] && [ "$PREBUILT" != none ]; then
+            if extract "$tools_image" /prebuilt_tools; then
+              tools=prebuilt
+            else
+              echo "::warning title=tools container::$tools_image is not usable, the host tools are built from scratch (about 10 minutes more)"
+              sudo rm -rf /prebuilt_tools
+            fi
+          fi
+          if [ "$tools" = build ]; then
+            sudo rm -rf /prebuilt_tools /external-toolchain
+          fi
+
+          if [ "$toolchain" = container ]; then
+            # same lookup as the external_container case of the reference
+            tc=$(echo /external-toolchain/openwrt-toolchain-*/toolchain-*)
+            if [ -x "$tc/bin/mips64-openwrt-linux-musl-gcc" ]; then
+              desc="prebuilt toolchain from the container $image_ref"
+            else
+              echo "::warning title=toolchain container::no mips64 musl gcc under /external-toolchain, using the snapshot toolchain"
+              toolchain=snapshot
+            fi
+          fi
+          if [ "$toolchain" = snapshot ]; then
+            snapshot_toolchain
+            tc=$(echo "$HOME"/tc/openwrt-toolchain-*/toolchain-*)
+            desc="prebuilt snapshot toolchain, $TOOLCHAIN_FILE"
+          fi
+          test -x "$tc/bin/mips64-openwrt-linux-musl-gcc"
+
+          {
+            echo "TC=$tc"
+            echo "PREBUILT_TOOLS=$([ "$tools" = prebuilt ] && echo 1 || echo 0)"
+            echo "TOOLCHAIN_DESC=$desc"
+          } >> "$GITHUB_ENV"
+          echo "desc=$desc" >> "$GITHUB_OUTPUT"
+          echo "tools: $tools, toolchain: $toolchain ($tc)"
+          df -h /
+
+      - name: Link the prebuilt tools into the tree
+        if: env.PREBUILT_TOOLS == '1'
+        run: |
+          pt=/prebuilt_tools
+          bad=
+          if [ -d "$pt/staging_dir/host" ] && [ -d "$pt/build_dir/host" ]; then
+            mkdir -p staging_dir build_dir
+            ln -s "$pt/staging_dir/host" staging_dir/host
+            ln -s "$pt/build_dir/host" build_dir/host
+
+            # The tools were built in another container. Touch their empty stamp files so make
+            # takes them as newer than the fresh checkout. Must run after the checkout.
+            ./scripts/ext-tools.sh --refresh || bad="$bad ext-tools.sh"
+
+            # Do the container's host tools run on this runner? A newer libc/libstdc++ in the
+            # image than on ubuntu-latest shows up here as "not found" or "version ... not found".
+            for f in staging_dir/host/bin/*; do
+              [ -f "$f" ] && [ ! -L "$f" ] && [ -x "$f" ] || continue
+              head -c4 "$f" | grep -q ELF || continue
+              out=$(ldd "$f" 2>&1 || true)
+              if grep -q 'not found' <<<"$out"; then
+                echo "$f:"; grep 'not found' <<<"$out"
+                bad="$bad $f"
+              fi
+            done
+            # Run a few tools. fakeroot, libtool and bison are patched to find their files
+            # through STAGING_DIR_HOST (which make exports), so set it as the build does.
+            for cmd in "ccache --version" "m4 --version" "sed --version" "fakeroot true"; do
+              set -- $cmd
+              [ -x "staging_dir/host/bin/$1" ] || continue
+              if ! STAGING_DIR_HOST="$PWD/staging_dir/host" "staging_dir/host/bin/$1" "${@:2}" >/dev/null 2>&1; then
+                echo "staging_dir/host/bin/$cmd failed"
+                bad="$bad $1"
+              fi
+            done
+          else
+            echo "$pt has no staging_dir/host and build_dir/host"
+            bad=" layout"
+          fi
+
+          # Unusable: drop them and build the tools from scratch instead of failing.
+          if [ -n "$bad" ]; then
+            echo "::warning title=prebuilt tools unusable::problems:$bad. The host tools are built from scratch."
+            rm -rf staging_dir/host build_dir/host   # the symlinks, not what they point to
+            echo "PREBUILT_TOOLS=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Feeds
+        run: |
+          # only the packages feed is needed (iperf3, conntrack)
+          grep '^src-git packages ' feeds.conf.default > feeds.conf
+          cat feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install iperf3 conntrack
+
+      - name: Configure
+        run: |
+          # CONFIG_AUTOREMOVE is part of the stamp names of the prebuilt host tools; it has
+          # to be set the way the container was built (the reference sets it too).
+          # ext-toolchain.sh writes the target and CONFIG_EXTERNAL_TOOLCHAIN_* into .config
+          # and runs make defconfig.
+          rm -f .config
+          printf '%s\n' CONFIG_DEVEL=y CONFIG_AUTOREMOVE=y CONFIG_CCACHE=y > .config
+          ./scripts/ext-toolchain.sh --toolchain "$TC" --overwrite-config --config octeon/generic
+
+          # all devices in one build (one kernel, like the buildbot), per-device rootfs
+          frag="$FRAGMENT"
+          cat "$frag" >> .config
+          make defconfig
+
+          # defconfig silently drops options whose dependencies are missing
+          want=$({ grep -E '^CONFIG_[A-Za-z0-9_+-]+=y$' "$frag"
+                   printf '%s\n' CONFIG_DEVEL=y CONFIG_AUTOREMOVE=y CONFIG_CCACHE=y CONFIG_EXTERNAL_TOOLCHAIN=y; })
+          missing=$(while read -r l; do grep -qxF "$l" .config || echo "$l"; done <<<"$want")
+          if [ -n "$missing" ]; then
+            echo "::error::options dropped by defconfig:"; echo "$missing"; exit 1
+          fi
+          echo "devices: $(grep -c '^CONFIG_TARGET_DEVICE_octeon_generic_DEVICE_.*=y' .config)"
+          grep -E '^CONFIG_(TARGET_octeon|TARGET_PROFILE|EXTERNAL_TOOLCHAIN|EXTERNAL_GCC_VERSION|AUTOREMOVE|CCACHE)' .config
+
+          # an external toolchain that is not the tree's default GCC builds, but is not what
+          # the tree was tested with
+          tree_gcc=$(sed -n 's/^\tdefault "\([0-9.]*\)"$/\1/p' toolchain/gcc/Config.version | tail -n1)
+          tc_gcc=$(sed -n 's/^CONFIG_EXTERNAL_GCC_VERSION="\(.*\)"$/\1/p' .config)
+          if [ "$tree_gcc" != "$tc_gcc" ]; then
+            echo "::warning title=toolchain GCC::the toolchain has GCC $tc_gcc, the tree defaults to GCC $tree_gcc"
+          fi
+
+      - name: Download sources
+        id: download
+        run: |
+          # With prebuilt tools the tool and toolchain sources are not needed.
+          targets="package/download target/download"
+          [ "$PREBUILT_TOOLS" = 1 ] || targets=download
+          mkdir -p dl
+          before=$(find dl -type f | wc -l)
+          make -j"$(nproc)" $targets
+          find dl -size -1024c -exec ls -l {} \; -exec rm -f {} \;
+          after=$(find dl -type f | wc -l)
+          echo "new_files=$((after - before))" >> "$GITHUB_OUTPUT"
+          echo "downloaded $((after - before)) new files"
+
+      # --- build phases: one step each, so GitHub shows how long each takes ---
+      # BUILD_LOG=1 writes a log per package to logs/. On failure
+      # show_build_failures.sh prints the make errors with context from those logs and
+      # exits with make's status; the logs are uploaded as an artifact below.
+
+      - name: make tools/install
+        run: |
+          start=$SECONDS
+          make tools/install -j"$(nproc)" BUILD_LOG=1 || ret=$? .github/workflows/scripts/show_build_failures.sh
+          took=$((SECONDS - start))
+          echo "tools/install took ${took}s"
+          if [ "$PREBUILT_TOOLS" = 1 ] && [ "$took" -gt 150 ]; then
+            echo "::warning title=tools/install::took ${took}s with prebuilt tools; some tools were rebuilt (the tree's tools differ from the container's)"
+          fi
+
+      - name: Configure ccache
+        run: |
+          ccache=staging_dir/host/bin/ccache
+
+          # ccache does not recognise the compiler behind the external toolchain's wrapper
+          # script, force gcc (as the reference does).
+          #
+          # compiler_check: the wrapper has a new mtime on every run, so name the compiler
+          # instead: the last commit that changed toolchain/gcc or toolchain/binutils at the
+          # revision the toolchain was built from, as in the reference. Falls back to HEAD
+          # when the toolchain is newer than this tree.
+          gcc_bin=$(find "$TC/bin" -name '*-openwrt-linux-*-gcc' \( -type f -o -type l \) | head -n1)
+          toolchain_rev=$("$gcc_bin" --version | head -n1 | grep -oE 'r[0-9]+-[0-9a-f]+' | sed 's/^r[0-9]*-//' || true)
+          rev=HEAD
+          if [ -n "$toolchain_rev" ] && git cat-file -e "$toolchain_rev^{commit}" 2>/dev/null; then
+            rev=$toolchain_rev
+          fi
+          sha=$(git log -1 --format=%H "$rev" -- toolchain/gcc/ toolchain/binutils/)
+          name=$(basename "$(dirname "$TC")")
+          echo "toolchain rev $rev -> last toolchain change $sha ($name)"
+
+          # The sloppiness list is the reference's. ccache 4.13 accepts file_macro but does not
+          # keep it (not shown by --show-config); harmless. The settings go into the primary
+          # config in CCACHE_DIR, so they do not depend on where the prebuilt ccache looks for
+          # its system config.
+          mkdir -p "$CCACHE_DIR"
+          "$ccache" --set-config=compiler_type=gcc
+          "$ccache" --set-config=max_size=4G
+          "$ccache" --set-config=sloppiness=file_macro,locale,time_macros,include_file_ctime,include_file_mtime
+          "$ccache" --set-config="compiler_check=string:$sha:$name"
+          "$ccache" --zero-stats
+          "$ccache" --show-config | grep -E 'compiler_check|compiler_type|max_size|sloppiness|depend_mode|cache_dir '
+
+      - name: make toolchain/install
+        run: make toolchain/install -j"$(nproc)" BUILD_LOG=1 || ret=$? .github/workflows/scripts/show_build_failures.sh
+
+      - name: make target/compile (kernel)
+        run: make target/compile -j"$(nproc)" BUILD_LOG=1 || ret=$? .github/workflows/scripts/show_build_failures.sh
+
+      - name: make package/compile
+        run: make package/compile -j"$(nproc)" BUILD_LOG=1 || ret=$? .github/workflows/scripts/show_build_failures.sh
+
+      - name: make package/install and target/install (images)
+        run: |
+          # two invocations: target/install needs package/install, and goals of one make
+          # run in parallel under -j
+          make package/install -j"$(nproc)" BUILD_LOG=1 || ret=$? .github/workflows/scripts/show_build_failures.sh
+          make target/install -j"$(nproc)" BUILD_LOG=1 || ret=$? .github/workflows/scripts/show_build_failures.sh
+
+      - name: make world (package index, profiles.json, checksums, buildinfo)
+        # everything is built by now; this runs what world does after the phases
+        run: make world -j"$(nproc)" BUILD_LOG=1 || ret=$? .github/workflows/scripts/show_build_failures.sh
+
+      - name: ccache statistics
+        if: always()
+        run: staging_dir/host/bin/ccache -vv --show-stats || true
+
+      - name: Disk use
+        if: always()
+        run: df -h /; du -sh build_dir staging_dir bin dl .ccache /prebuilt_tools 2>/dev/null || true
+
+      - name: Collect the files to publish
+        run: |
+          src=bin/targets/octeon/generic
+          mkdir -p out
+          shopt -s nullglob
+          for f in "$src"/*-initramfs-kernel.bin "$src"/*-sysupgrade.* "$src"/*.manifest \
+                   "$src"/config.buildinfo "$src"/feeds.buildinfo "$src"/version.buildinfo \
+                   "$src"/profiles.json; do
+            cp "$f" out/
+          done
+          cp .config out/dot-config
+          (cd out && sha256sum -- * > ../sha256sums.tmp) && mv sha256sums.tmp out/sha256sums
+          ls -l out
+          # under nullglob a bare ls would list . and succeed
+          set -- out/*-initramfs-kernel.bin
+          [ $# -gt 0 ] || { echo "::error::no initramfs images"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: octeon-health-images
+          path: out/
+          retention-days: 7
+
+      - name: Upload the build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Trim the ccache, decide whether it is worth saving
+        id: ccache_save
+        if: ${{ !cancelled() }}
+        run: |
+          ccache=staging_dir/host/bin/ccache
+          save=false
+          if [ -x "$ccache" ]; then
+            misses=$("$ccache" --print-stats | awk '$1 == "cache_miss" { print $2 }')
+            echo "ccache misses this run: ${misses:-unknown}"
+            # a cache that already had nearly everything is not uploaded again
+            if [ -z "$misses" ] || [ "$misses" -ge 25 ]; then
+              save=true
+              # keep what this run used, drop the rest
+              "$ccache" --evict-older-than 1d
+              "$ccache" --cleanup
+              du -sh "$CCACHE_DIR"
+            fi
+          fi
+          echo "save=$save" >> "$GITHUB_OUTPUT"
+
+      - name: Save ccache
+        if: ${{ !cancelled() && steps.ccache_save.outputs.save == 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-octeon-${{ hashFiles('toolchain/**', 'target/linux/octeon/**', 'target/linux/generic/**', 'include/kernel-6.18', 'package/**/Makefile', '!package/feeds/**') }}-${{ github.run_id }}
+
+      - name: Save dl/ cache
+        if: ${{ !cancelled() && steps.download.outputs.new_files != '0' }}
+        uses: actions/cache/save@v4
+        with:
+          path: dl
+          key: dl-${{ hashFiles('package/**/Makefile', '!package/feeds/**', 'toolchain/**/Makefile', 'tools/**/Makefile', 'target/linux/octeon/Makefile', 'include/kernel-6.18', 'feeds.conf.default') }}-${{ github.run_id }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # never cancelled halfway: delete + create of a release must not be split
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: octeon-health-images
+          path: out
+
+      - name: Publish releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOOLCHAIN_DESC: ${{ needs.build.outputs.toolchain }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          short=${GITHUB_SHA::7}
+          tag=octeon-health-$short
+          devices=$(ls out/*-initramfs-kernel.bin | sed -E 's/.*octeon-generic-(.*)-initramfs-kernel\.bin/\1/' | sed 's/^/- /')
+          subject=$(git log -1 --format=%s)
+          toolchain="$TOOLCHAIN_DESC"
+          cat > notes.md <<NOTES
+          Test images for the OCTEON router debugging kit (octeon_pip), built from \`$GITHUB_SHA\` on branch \`$GITHUB_REF_NAME\`.
+
+          > $subject
+
+          Toolchain: $toolchain. Not for production: debugfs, /dev/mem and KALLSYMS are enabled.
+
+          ## Devices
+
+          $devices
+
+          Files: \`*-initramfs-kernel.bin\` (boots from RAM, changes nothing on flash), \`*-sysupgrade.tar\`, \`*.manifest\`, \`config.buildinfo\` (config as built), \`sha256sums\`.
+
+          ## Boot the initramfs from U-Boot
+
+          Pick the file for your board and check it against \`sha256sums\`. Over the network:
+
+          \`\`\`
+          setenv ipaddr 192.168.1.1; setenv serverip 192.168.1.2
+          tftpboot \$(loadaddr) openwrt-octeon-generic-<device>-initramfs-kernel.bin
+          bootoctlinux \$(loadaddr) numcores=\$(numcores) endbootargs mem=0
+          \`\`\`
+
+          From a FAT USB stick or CF card:
+
+          \`\`\`
+          usb start
+          fatload usb 0 \$(loadaddr) openwrt-octeon-generic-<device>-initramfs-kernel.bin
+          bootoctlinux \$(loadaddr) numcores=\$(numcores) endbootargs mem=0
+          \`\`\`
+
+          Nothing is written to flash; a reboot returns to the installed system.
+
+          ## Run octeon-health
+
+          On the booted image (console or ssh), run \`octeon-health\`. It takes the snapshot, runs the benchmarks against your PC (\`PEER=<pc ip>\`; start \`iperf3 -s\` on the PC) and prints the \`scp\` line for the report \`.tar.gz\`. Paste \`summary.md\` into the GitHub comment and attach the archive. The knobs (\`T\`, \`N\`, \`NOPIN\`, \`NOAB\`, \`NOFWD\`, \`NOBENCH\`, \`FWD_PEER\`) are described in the [HOWTO](https://github.com/spolack/openwrt/blob/octeon-health/.github/octeon-health/HOWTO.md#options).
+          NOTES
+
+          publish() { # tag, title, extra gh flags
+            gh release delete "$1" --yes --cleanup-tag 2>/dev/null || true
+            gh release create "$1" out/* --title "$2" --notes-file notes.md \
+              --prerelease --target "$GITHUB_SHA" $3
+          }
+          publish "$tag" "octeon-health $short" ""
+          publish octeon-health-latest "octeon-health latest ($short)" "--latest=false"
