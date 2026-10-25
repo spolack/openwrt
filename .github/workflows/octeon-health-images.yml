@@ -434,6 +434,8 @@ jobs:
 
           Toolchain: $toolchain. Not for production: debugfs, /dev/mem and KALLSYMS are enabled.
 
+          **How to test: [HOWTO](https://github.com/spolack/openwrt/blob/octeon-health/.github/octeon-health/HOWTO.md)** (host setup, booting from U-Boot, running octeon-health, what to post).
+
           ## Devices
 
           $devices
