@@ -1,0 +1,204 @@
+name: octeon-health images
+
+on:
+  push:
+    branches:
+      - octeon-health
+  workflow_dispatch:
+    inputs:
+      toolchain:
+        description: 'Toolchain: prebuilt snapshot (external) or build it with ccache (build)'
+        type: choice
+        options:
+          - external
+          - build
+        default: external
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  SNAPSHOT_URL: https://downloads.openwrt.org/snapshots/targets/octeon/generic
+  # must match the tree's default GCC (toolchain/gcc/Config.version) and musl
+  TOOLCHAIN_FILE: openwrt-toolchain-octeon-generic_gcc-14.4.0_musl.Linux-x86_64.tar.zst
+  TOOLCHAIN_MODE: ${{ inputs.toolchain || 'external' }}
+  FRAGMENT: .github/octeon-health/testkit.config
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3-setuptools rsync swig \
+            unzip zlib1g-dev file wget zstd ccache jq
+
+      - uses: actions/checkout@v4
+
+      - name: Check the config fragment exists
+        run: test -s "$FRAGMENT"
+
+      - name: Cache dl/
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: dl-${{ hashFiles('package/**/Makefile', 'target/**/Makefile', 'feeds.conf.default') }}
+          restore-keys: dl-
+
+      - name: Cache ccache (own toolchain only)
+        if: env.TOOLCHAIN_MODE == 'build'
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: ccache-
+
+      - name: Feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Fetch the prebuilt toolchain
+        if: env.TOOLCHAIN_MODE == 'external'
+        run: |
+          mkdir -p "$HOME/tc" && cd "$HOME/tc"
+          curl -fsSL "$SNAPSHOT_URL/sha256sums" | grep -F " *$TOOLCHAIN_FILE" > toolchain.sha256
+          test -s toolchain.sha256
+          curl -fsSL -O "$SNAPSHOT_URL/$TOOLCHAIN_FILE"
+          sha256sum -c toolchain.sha256
+          zstd -dc "$TOOLCHAIN_FILE" | tar -x
+          rm "$TOOLCHAIN_FILE"
+          # the directory with bin/ and lib/ inside the unpacked tree
+          tc=$(echo "$HOME"/tc/openwrt-toolchain-*/toolchain-*)
+          test -x "$tc"/bin/mips64-openwrt-linux-musl-gcc
+          echo "TC=$tc" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          rm -f .config
+          if [ "$TOOLCHAIN_MODE" = external ]; then
+            # writes the target and CONFIG_EXTERNAL_TOOLCHAIN_* into .config
+            ./scripts/ext-toolchain.sh --toolchain "$TC" --overwrite-config --config octeon/generic
+          else
+            printf '%s\n' CONFIG_TARGET_octeon=y CONFIG_TARGET_octeon_generic=y CONFIG_DEVEL=y CONFIG_CCACHE=y > .config
+          fi
+          {
+            echo CONFIG_TARGET_MULTI_PROFILE=y
+            echo CONFIG_TARGET_ALL_PROFILES=y
+            echo CONFIG_TARGET_PER_DEVICE_ROOTFS=y
+            cat "$FRAGMENT"
+          } >> .config
+          make defconfig
+
+          # defconfig silently drops options whose dependencies are missing
+          missing=$(grep -E '^CONFIG_[A-Za-z0-9_+-]+=y$' "$FRAGMENT" | while read -r l; do grep -qxF "$l" .config || echo "$l"; done)
+          if [ -n "$missing" ]; then
+            echo "::error::options dropped by defconfig:"; echo "$missing"; exit 1
+          fi
+          grep -E '^CONFIG_(TARGET_octeon|EXTERNAL_TOOLCHAIN|EXTERNAL_GCC_VERSION|TARGET_PER_DEVICE_ROOTFS)' .config
+          grep -c '^CONFIG_TARGET_DEVICE_octeon_generic_DEVICE_.*=y' .config
+
+      - name: Download sources
+        run: |
+          make -j"$(nproc)" download
+          find dl -size -1024c -exec ls -l {} \; -exec rm -f {} \;
+
+      - name: Build
+        run: make -j"$(nproc)" world || make -j1 V=s world
+
+      - name: Disk use
+        if: always()
+        run: df -h /; du -sh build_dir staging_dir bin dl 2>/dev/null || true
+
+      - name: Collect the files to publish
+        run: |
+          src=bin/targets/octeon/generic
+          mkdir -p out
+          cp "$src"/*-initramfs-kernel.bin "$src"/*-sysupgrade.* "$src"/*.manifest \
+             "$src"/config.buildinfo "$src"/feeds.buildinfo "$src"/version.buildinfo \
+             "$src"/profiles.json out/
+          cp .config out/dot-config
+          (cd out && sha256sum -- * > ../sha256sums.tmp) && mv sha256sums.tmp out/sha256sums
+          ls -l out
+          ls out/*-initramfs-kernel.bin >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: octeon-health-images
+          path: out/
+          retention-days: 7
+
+      - name: Publish releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          short=${GITHUB_SHA::7}
+          tag=octeon-health-$short
+          devices=$(ls out/*-initramfs-kernel.bin | sed -E 's/.*octeon-generic-(.*)-initramfs-kernel\.bin/\1/' | sed 's/^/- /')
+          subject=$(git log -1 --format=%s)
+          if [ "$TOOLCHAIN_MODE" = external ]; then
+            toolchain="prebuilt snapshot toolchain, $TOOLCHAIN_FILE"
+          else
+            toolchain="built from source with ccache"
+          fi
+          cat > notes.md <<NOTES
+          Test images for the OCTEON router debugging kit (octeon_pip), built from \`$GITHUB_SHA\` on branch \`$GITHUB_REF_NAME\`.
+
+          > $subject
+
+          Toolchain: $toolchain. Not for production: debugfs, /dev/mem and KALLSYMS are enabled.
+
+          ## Devices
+
+          $devices
+
+          Files: \`*-initramfs-kernel.bin\` (boots from RAM, changes nothing on flash), \`*-sysupgrade.tar\`, \`*.manifest\`, \`config.buildinfo\` (config as built), \`sha256sums\`.
+
+          ## Boot the initramfs from U-Boot
+
+          Pick the file for your board and check it against \`sha256sums\`. Over the network:
+
+          \`\`\`
+          setenv ipaddr 192.168.1.1; setenv serverip 192.168.1.2
+          tftpboot \$(loadaddr) openwrt-octeon-generic-<device>-initramfs-kernel.bin
+          bootoctlinux \$(loadaddr) numcores=\$(numcores) endbootargs mem=0
+          \`\`\`
+
+          From a FAT USB stick or CF card:
+
+          \`\`\`
+          usb start
+          fatload usb 0 \$(loadaddr) openwrt-octeon-generic-<device>-initramfs-kernel.bin
+          bootoctlinux \$(loadaddr) numcores=\$(numcores) endbootargs mem=0
+          \`\`\`
+
+          Nothing is written to flash; a reboot returns to the installed system.
+
+          ## Run octeon-health
+
+          On the booted image (console or ssh), run \`octeon-health\`. It takes the snapshot, runs the benchmarks against your PC (\`PEER=<pc ip>\`; start \`iperf3 -s\` on the PC) and prints the \`scp\` line for the report \`.tar.gz\`. Paste \`summary.md\` into the GitHub comment and attach the archive. The knobs (\`T\`, \`N\`, \`NOPIN\`, \`NOAB\`, \`NOFWD\`, \`NOBENCH\`, \`FWD_PEER\`) are described in the kit's README.
+          NOTES
+
+          publish() { # tag, title, extra gh flags
+            gh release delete "$1" --yes --cleanup-tag 2>/dev/null || true
+            gh release create "$1" out/* --title "$2" --notes-file notes.md \
+              --prerelease --target "$GITHUB_SHA" $3
+          }
+          publish "$tag" "octeon-health $short" ""
+          publish octeon-health-latest "octeon-health latest ($short)" "--latest=false"

@@ -19,6 +19,7 @@ on:
       - 'toolchain/**'
     branches-ignore:
       - master
+      - octeon-health
   workflow_dispatch:
 
 permissions:
