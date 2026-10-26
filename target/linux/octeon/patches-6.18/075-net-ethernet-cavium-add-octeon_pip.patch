@@ -4,7 +4,7 @@ Subject: [PATCH] net: ethernet: cavium: add octeon_pip
 
 Backport to 6.18 of the octeon_pip series prepared for net-next and not
 posted yet (15 patches, branch octeon-pip-rfc-v1 of
-https://github.com/spolack/linux, 6c34e76095dd on net-next
+https://github.com/spolack/linux, bd4637e9f7b7 on net-next
 98c2ad4f5d80), squashed into one patch: the driver for the Ethernet
 ports behind the PIP/IPD and PKO units of OCTEON, OCTEON+, OCTEON II and
 the CN70XX/CN71XX, with phylink and the SGMII/QSGMII/1000BASE-X PCS,
@@ -41,7 +41,7 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 ---
  .../bindings/net/cavium,octeon-3860-pip.yaml  |  190 ++
  .../devicetree/bindings/net/cavium-pip.txt    |   99 -
- .../ethernet/cavium/octeon_pip.rst            |  242 ++
+ .../ethernet/cavium/octeon_pip.rst            |  244 ++
  .../device_drivers/ethernet/index.rst         |    1 +
  drivers/net/ethernet/cavium/Kconfig           |   21 +
  drivers/net/ethernet/cavium/octeon/Makefile   |   14 +
@@ -66,9 +66,9 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
  .../ethernet/cavium/octeon/octeon_pip_regs.h  |  724 +++++
  .../ethernet/cavium/octeon/octeon_pip_rx.c    | 1400 ++++++++++
  .../ethernet/cavium/octeon/octeon_pip_rx.h    |   23 +
- .../ethernet/cavium/octeon/octeon_pip_tx.c    | 1357 ++++++++++
+ .../ethernet/cavium/octeon/octeon_pip_tx.c    | 1382 ++++++++++
  .../ethernet/cavium/octeon/octeon_pip_tx.h    |   42 +
- 29 files changed, 11413 insertions(+), 99 deletions(-)
+ 29 files changed, 11440 insertions(+), 99 deletions(-)
 
 --- /dev/null
 +++ b/Documentation/devicetree/bindings/net/cavium,octeon-3860-pip.yaml
@@ -367,7 +367,7 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 -	};
 --- /dev/null
 +++ b/Documentation/networking/device_drivers/ethernet/cavium/octeon_pip.rst
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,244 @@
 +.. SPDX-License-Identifier: GPL-2.0
 +
 +==================================
@@ -606,8 +606,10 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 +  never cross a unit, and counts sent packets in a FAU register instead
 +  of asking for completion work.
 +- The output unit raises no event for a sent packet: transmit
-+  completions come from the receive polls and from a per-queue timer
-+  that schedules the queue's NAPI.
++  completions come from the receive polls, from a per-queue timer that
++  schedules the queue's NAPI, and from the transmit itself once a queue
++  is half full (the NAPI waits for any other NAPI on its CPU, such as
++  the RPS backlog).
 +- With a PHY on an SGMII or QSGMII port the in-band autonegotiation
 +  between the MAC's PCS and the PHY stays on.
 --- a/Documentation/networking/device_drivers/ethernet/index.rst
@@ -10281,7 +10283,7 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 +#endif /* OCTEON_PIP_RX_H */
 --- /dev/null
 +++ b/drivers/net/ethernet/cavium/octeon/octeon_pip_tx.c
-@@ -0,0 +1,1357 @@
+@@ -0,0 +1,1382 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The transmit side of octeon_pip.
@@ -10317,9 +10319,11 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 + * for every one). Every queue has a NAPI of its own on the port for the
 + * rest: a transmit outside of a receive poll schedules it once in 8
 + * packets, unless a poll has the queue on its list, and so does a timer
-+ * per queue for whatever is left when nothing else comes along. There is
-+ * no completion interrupt: a packet that asks for one is a three word
-+ * command.
++ * per queue for whatever is left when nothing else comes along. That NAPI
++ * waits for the one its CPU is in (the RPS backlog, another driver's), so
++ * from half full on a transmit outside of a receive poll reads the counter
++ * itself. There is no completion interrupt: a packet that asks for one is
++ * a three word command.
 + *
 + * Derived in part from the staging octeon driver (ethernet-tx.c: the
 + * short frame padding of CN3XXX),
@@ -10353,6 +10357,13 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 +
 +/* Free slots a stopped transmit queue needs before it is woken */
 +#define OPIP_TX_WAKE_THRESH	(OPIP_TXQ_DEPTH / 4)
++
++/*
++ * Packets in flight from which a transmit outside of a receive poll
++ * completes the queue itself instead of scheduling its NAPI, which runs
++ * only once the NAPI its CPU is in returns, see opip_tx_batch()
++ */
++#define OPIP_TX_COMPLETE_THRESH	(OPIP_TXQ_DEPTH / 2)
 +
 +/*
 + * Packets written between two reads of the counter by the transmit paths.
@@ -10502,16 +10513,19 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 + *
 + * @budget is the budget the core passed to the NAPI poll this runs in: a
 + * receive poll (its ticks, its end, what it transmits) or the queue's own
-+ * NAPI. The skbs go into the per-CPU NAPI cache they were built from. A
-+ * drain, from process context, and the watchdog pass 0 and free to the
-+ * slab. netpoll transmits with interrupts off and bottom halves on, so it
-+ * leaves the completion to the NAPI and to opip_tx_netpoll(). The stack
-+ * delivers the last packets of every poll (its GRO batch) after the poll
-+ * has returned, so a third of a forwarding load's packets are sent from
-+ * outside the poll on the poll's CPU; freeing those to the slab starved
-+ * the cache, and the next poll built its skbs cold from the slab. A transmit
-+ * outside a receive poll leaves them to the next poll that has the queue
-+ * on its list, or schedules the queue's NAPI, see opip_tx_kick().
++ * NAPI, or any non-zero one for a transmit in a softirq outside of a
++ * receive poll. The skbs go into the per-CPU NAPI cache they were built
++ * from. A drain from process context, the watchdog and a transmit outside
++ * of a softirq pass 0 and free to the slab. netpoll transmits with
++ * interrupts off and bottom halves on, so it leaves the completion to the
++ * NAPI and to opip_tx_netpoll(). The stack delivers the last packets of
++ * every poll (its GRO batch) after the poll has returned, so a third of a
++ * forwarding load's packets are sent from outside the poll on the poll's
++ * CPU; freeing those to the slab starved the cache, and the next poll
++ * built its skbs cold from the slab. A transmit outside a receive poll
++ * leaves them to the next poll that has the queue on its list, or
++ * schedules the queue's NAPI, see opip_tx_kick(), until the ring is half
++ * full, see opip_tx_batch().
 + *
 + * Return: the number of packets completed
 + */
@@ -10605,6 +10619,29 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 +	q->written = 0;
 +	if (!q->poll_dirty)
 +		napi_schedule(&q->napi);
++}
++
++/*
++ * A transmit has written OPIP_TX_COMPLETE_BATCH packets: complete them in
++ * a receive poll, under the poll's budget. Outside of one the queue's NAPI
++ * does, but the RPS backlog's poll of 64 GRO super-skbs fills the ring
++ * several times over before the NAPI gets to run, and the PKO idles on a
++ * ring of sent packets meanwhile: from OPIP_TX_COMPLETE_THRESH on the
++ * transmit completes them itself, with a NAPI budget in a softirq, to the
++ * slab from process context. Below it the FAU read is not worth it. Under
++ * the queue lock, never for netpoll.
++ */
++static __always_inline void opip_tx_batch(struct net_device *dev,
++					  unsigned int qid, struct opip_txq *q,
++					  struct opip_tx_poll *poll)
++{
++	if (poll)
++		opip_tx_complete(dev, qid, q, poll->budget);
++	else if (opip_txq_inflight(q) >= OPIP_TX_COMPLETE_THRESH)
++		opip_tx_complete(dev, qid, q,
++				 in_serving_softirq() ? NAPI_POLL_WEIGHT : 0);
++	else
++		opip_tx_kick(q);
 +}
 +
 +/*
@@ -11084,16 +11121,9 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 +	    READ_ONCE(p->pad_runts) && __skb_put_padto(skb, 64, false))
 +		goto drop;
 +
-+	/*
-+	 * The packets sent a batch ago are out: make room before adding,
-+	 * in a receive poll under its budget, else in the queue's NAPI
-+	 */
-+	if (q->written >= OPIP_TX_COMPLETE_BATCH && !netpoll_tx_running(dev)) {
-+		if (poll)
-+			opip_tx_complete(dev, qid, q, poll->budget);
-+		else
-+			opip_tx_kick(q);
-+	}
++	/* The packets sent a batch ago are out: make room before adding */
++	if (q->written >= OPIP_TX_COMPLETE_BATCH && !netpoll_tx_running(dev))
++		opip_tx_batch(dev, qid, q, poll);
 +
 +	/*
 +	 * Before the command is written: a completion may free the skb then.
@@ -11255,7 +11285,8 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 + * The frames are sent on the queue of this CPU, like the stack's packets
 + * from this CPU, under the same lock. A redirect from a receive poll of
 + * this driver comes in that poll and completes under its budget; from
-+ * elsewhere the completion is the queue's NAPI's.
++ * elsewhere the queue's NAPI completes, or the transmit itself once the
++ * ring is half full, see opip_tx_batch().
 + *
 + * Return: the number of frames sent
 + */
@@ -11282,12 +11313,8 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 +	/* Bottom halves are off, never an interrupt: see opip_xmit() */
 +	poll = __this_cpu_read(opip_tx_poll_cur);
 +	__netif_tx_lock(txq, cpu);
-+	if (q->written >= OPIP_TX_COMPLETE_BATCH) {
-+		if (poll)
-+			opip_tx_complete(dev, qid, q, poll->budget);
-+		else
-+			opip_tx_kick(q);
-+	}
++	if (q->written >= OPIP_TX_COMPLETE_BATCH)
++		opip_tx_batch(dev, qid, q, poll);
 +	for (i = 0; i < n; i++) {
 +		struct xdp_frame *xdpf = frames[i];
 +
