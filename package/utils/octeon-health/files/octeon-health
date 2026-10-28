@@ -22,7 +22,7 @@ case "$T" in ''|*[!0-9]*) T=10 ;; esac
 [ "$T" -ge 5 ] || T=5	# the CPU window is 2 s in to 2 s before the end
 case "$N" in ''|*[!0-9]*|0) N=3 ;; esac
 NETNS_NET=10.99.0
-VERSION=1
+VERSION=2
 
 # ---------------------------------------------------------------- helpers
 
@@ -152,6 +152,16 @@ cpu_delta() {
 # the rx/tx bytes and packets of all octeon_pip ports: the MAC counters of
 # ethtool's eth-mac group, read fresh; sysfs (updated once a second by the
 # driver's worker) when ethtool has no groups
+# the per-second sampler: sysfs only, one cat per port, the device list
+# taken once (ethtool and the readlink loop every second would show up in
+# the router's CPU column): net_snap_fast FILE DEVS
+net_snap_fast() {
+	f=$1; shift
+	for d in "$@"; do
+		s=/sys/class/net/$d/statistics
+		echo "$d" $(cat $s/rx_bytes $s/tx_bytes $s/rx_packets $s/tx_packets 2>/dev/null)
+	done > "$f"
+}
 net_snap() {
 	for d in $(opip_devs); do
 		m=$(ethtool -S "$d" --groups eth-mac 2>/dev/null | awk -F': *' '
@@ -314,6 +324,7 @@ snapshot() {	# DIR
 			cap "$f" "ethtool $o $n"
 		done
 		cap "$f" "ethtool -S $n --all-groups"
+		port_stats "$f" "$d"
 		cap "$f" "cd $d && for a in speed duplex carrier carrier_changes operstate mtu iflink ifindex threaded napi_defer_hard_irqs gro_flush_timeout; do echo \$a=\$(cat \$a 2>/dev/null); done"
 		cap "$f" "readlink -f $d/of_node $d/device $d/device/driver"
 		cap "$f" "for q in $d/queues/*; do echo \$q rps=\$(cat \$q/rps_cpus 2>/dev/null) xps=\$(cat \$q/xps_cpus 2>/dev/null); done"
@@ -356,6 +367,32 @@ snapshot() {	# DIR
 
 	regs_now "$S"
 	conduit_check "$S"
+	mask "$S"/*.txt
+}
+
+# port_stats FILE DIR: the interface statistics (rx_missed_errors = the
+# hardware's RED drops, rx_fifo_errors, ...) as "stat_NAME: VALUE" lines
+port_stats() {
+	cap "$1" "cd $2/statistics 2>/dev/null && for a in *; do echo \"stat_\$a: \$(cat \$a)\"; done"
+}
+
+# after DIR: what changes under load, taken again after the tests: the
+# driver's debugfs state, the counters of every port, dmesg, softnet
+after() {
+	S=$1; mkdir -p "$S"
+	cap "$S/driver.txt" "cat /sys/kernel/debug/octeon_pip/*/status"
+	cap "$S/driver.txt" "dmesg | grep -iE 'octeon_pip|phylink|sfp|mdio|dsa|link is|pcs'"
+	dmesg > "$S/dmesg.txt" 2>&1
+	cap "$S/net.txt" "cat /proc/net/dev /proc/net/softnet_stat"
+	cap "$S/net.txt" "cat /proc/interrupts"
+	for d in /sys/class/net/*; do
+		n=${d##*/}
+		[ "$n" = lo ] && continue
+		f=$S/ethtool-$n.txt
+		cap "$f" "ethtool -S $n"
+		cap "$f" "ethtool -S $n --all-groups"
+		port_stats "$f" "$d"
+	done
 	mask "$S"/*.txt
 }
 
@@ -509,8 +546,9 @@ build_tests() {
 	done
 }
 
-# parse JSON A B: "Mbit/s retrans cpu..." from an iperf3 result and two
-# CPU snapshots
+# result JSON CPU_A CPU_B NET_A NET_B SECONDS: "Mbit/s retrans rx/tx-kpps
+# cpu..." from an iperf3 result, two CPU and two MAC counter snapshots;
+# retransmits "-" when the JSON has none (the router as the server, -R)
 result() {
 	bps=$(echo "$1" | jsonfilter -e '@.end.sum_received.bits_per_second' 2>/dev/null)
 	# a sending server's own result has nothing received: take what it sent
@@ -522,7 +560,11 @@ result() {
 	err=$(echo "$1" | jsonfilter -e '@.error' 2>/dev/null)
 	if [ -z "$bps" ]; then echo "FAIL ${err:-no result}"; return; fi
 	cpu="cpu n/a"; [ -f "$2" ] && [ -f "$3" ] && cpu=$(cpu_delta "$2" "$3")
-	echo "$(awk -v b="$bps" 'BEGIN { printf "%d", b / 1e6 }') ${rtr:-0} $cpu"
+	pps=-/-
+	if [ -f "$4" ] && [ -f "$5" ] && [ "${6:-0}" -gt 0 ]; then
+		set -- $(net_delta "$4" "$5" "$6"); pps=$8/${11}
+	fi
+	echo "$(awk -v b="$bps" 'BEGIN { printf "%d", b / 1e6 }') ${rtr:--} $pps $cpu"
 }
 
 # bg_wait PID: wait for a helper a second at a time, so that a TERM's trap
@@ -534,13 +576,14 @@ bg_wait() { while kill -0 "$1" 2>/dev/null; do sleep 1; done; bg_del "$1"; }
 run_pcserver() {
 	tmp=$BASE/.run.$$
 	pin=; [ "$2" != - ] && pin="-A $2"
-	(sleep 2; cpu_snap "$tmp.a"; sleep $((T - 4)); cpu_snap "$tmp.b") &
+	(sleep 2; cpu_snap "$tmp.a"; net_snap "$tmp.na"; sleep $((T - 4))
+	 cpu_snap "$tmp.b"; net_snap "$tmp.nb") &
 	sampler=$!; bg_add $sampler
 	iperf3 -J --connect-timeout 3000 -c "$PEER" ${PORT:+-p $PORT} -t "$T" $1 $pin > "$tmp.json" 2>&1 &
 	cli=$!; bg_add $cli
 	bg_wait $cli; bg_wait $sampler
-	r=$(result "$(cat "$tmp.json")" "$tmp.a" "$tmp.b")
-	rm -f "$tmp.a" "$tmp.b" "$tmp.json"
+	r=$(result "$(cat "$tmp.json")" "$tmp.a" "$tmp.b" "$tmp.na" "$tmp.nb" $((T - 4)))
+	rm -f "$tmp.a" "$tmp.b" "$tmp.na" "$tmp.nb" "$tmp.json"
 }
 
 # the router as a one-shot server, CPU snapshots once a second; the
@@ -551,7 +594,10 @@ run_pcclient() {
 	pin=; [ "$2" != - ] && have taskset && pin="taskset -c $2"
 	$pin timeout "$3" iperf3 -s -1 -J ${PORT:+-p $PORT} > "$tmp.json" 2>&1 &
 	srv=$!; bg_add $srv
-	while kill -0 $srv 2>/dev/null; do cpu_snap "$tmp.d/$(date +%s)"; sleep 1; done
+	devs=$(opip_devs)
+	while kill -0 $srv 2>/dev/null; do
+		t=$(date +%s); cpu_snap "$tmp.d/$t"; net_snap_fast "$tmp.d/$t.net" $devs; sleep 1
+	done
 	bg_del $srv
 	json=$(cat "$tmp.json")
 	start=$(echo "$json" | jsonfilter -e '@.start.timestamp.timesecs' 2>/dev/null)
@@ -566,9 +612,9 @@ run_pcclient() {
 		esac
 		rm -rf "$tmp.d" "$tmp.json"; return
 	fi
-	a=$(ls "$tmp.d" | sort -n | awk -v t=$((start + 2)) '$1 >= t { print; exit }')
-	b=$(ls "$tmp.d" | sort -n | awk -v t=$((start + T - 2)) '$1 <= t { x = $1 } END { print x }')
-	r=$(result "$json" "$tmp.d/$a" "$tmp.d/$b")
+	a=$(ls "$tmp.d" | grep -v net | sort -n | awk -v t=$((start + 2)) '$1 >= t { print; exit }')
+	b=$(ls "$tmp.d" | grep -v net | sort -n | awk -v t=$((start + T - 2)) '$1 <= t { x = $1 } END { print x }')
+	r=$(result "$json" "$tmp.d/$a" "$tmp.d/$b" "$tmp.d/$a.net" "$tmp.d/$b.net" $((${b:-0} - ${a:-0})))
 	rm -rf "$tmp.d" "$tmp.json"
 }
 
@@ -624,7 +670,7 @@ run_tests() {	# MODE
 		echo "$name|$r" >> "$OUT/bench.txt"
 		case "$r" in
 		FAIL*) say "  [$k/$n] $name: $r" ;;
-		*) say "  [$k/$n] $name: ${r%% *} Mbit/s  cpu(busy/softirq%): ${r#* * }" ;;
+		*) say "  [$k/$n] $name: $(echo "$r" | awk '{ print $1 " Mbit/s  retrans " $2 "  rx/tx kpps " $3 }')  cpu(busy/softirq%): ${r#* * * }" ;;
 		esac
 		case "$r" in
 		"FAIL no client connected")
@@ -635,16 +681,53 @@ run_tests() {	# MODE
 	done 3< "$OUT/tests.lst"
 	# median per test, in the order of the list
 	{
-		echo "| test | median Mbit/s | runs | router CPU busy/softirq % (last run) |"
-		echo "|---|---|---|---|"
-		awk -F'|' '{ if (!($1 in n)) o[++k] = $1; split($2, f, " ")
-			if (f[1] != "FAIL") { v[$1, ++n[$1]] = f[1]; c[$1] = substr($2, index($2, "cpu")) }
+		echo "| test | median Mbit/s | runs | retransmits | rx/tx kpps (last run) | router CPU busy/softirq % (last run) |"
+		echo "|---|---|---|---|---|---|"
+		awk -F'|' '$1 != "forward" { if (!($1 in n)) o[++k] = $1; split($2, f, " ")
+			if (f[1] != "FAIL") { v[$1, ++n[$1]] = f[1]; rt[$1] = rt[$1] " " f[2]; p[$1] = f[3]
+				c[$1] = substr($2, index($2, "cpu")) }
 			else if (!($1 in n)) n[$1] = 0 }
 		END { for (i = 1; i <= k; i++) { t = o[i]; m = n[t]; s = ""
 			for (j = 1; j <= m; j++) { a[j] = v[t, j]; s = s " " v[t, j] }
 			for (x = 1; x <= m; x++) for (y = x + 1; y <= m; y++) if (a[y] < a[x]) { z = a[x]; a[x] = a[y]; a[y] = z }
-			printf "| %s | %s |%s | %s |\n", t, m ? a[int((m + 1) / 2)] : "-", s, c[t] } }' "$OUT/bench.txt"
+			printf "| %s | %s |%s |%s | %s | %s |\n", t, m ? a[int((m + 1) / 2)] : "-", s, rt[t] ? rt[t] : " -", p[t] ? p[t] : "-", c[t] } }' "$OUT/bench.txt"
 	} > "$OUT/bench-table.md"
+}
+
+# private4 ADDR: an RFC 1918 IPv4 address (not the carrier-grade NAT range)
+private4() {
+	echo "$1" | awk -F. '{ exit !($1 == 10 || ($1 == 172 && $2 >= 16 && $2 <= 31) || ($1 == 192 && $2 == 168)) }'
+}
+
+# wan_peer: a host on the router's WAN side that runs "iperf3 -s", as the
+# forwarding target when the PC has no second port; sets $target. Only
+# interactively, and only a private address or one on a subnet the router
+# is directly attached to: never a public host through the WAN's gateway,
+# which would load the tester's Internet link
+wan_peer() {
+	[ -n "$NONINTERACTIVE" ] && return 1
+	ask "Or is there another computer on the router's WAN side (your upstream network) that can run 'iperf3 -s'? Its IPv4 address, or skip" skip
+	case "$ans" in skip|""|n|N|no) return 1 ;; esac
+	r=$(ip -4 route get "$ans" 2>/dev/null) || { say "  no route to $ans"; return 1; }
+	case "$r" in local*) say "  $ans is the router itself"; return 1 ;; esac
+	dev=$(echo "$r" | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+	lan=$(ip -4 route get "$PEER" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+	if [ "$dev" = "$lan" ]; then
+		say "  $ans is on your PC's side ($dev), not behind the router"; return 1
+	fi
+	# a public address only on a network the WAN port is directly on:
+	# no gateway in between, and not just the default route of a
+	# point-to-point link (PPPoE, LTE) that has no " via "
+	if ! private4 "$ans" && ! ip -4 route show match "$ans" dev "$dev" 2>/dev/null | grep -v '^default' | grep -q .; then
+		say "  $ans is a public address not directly on the WAN network: refused (the test would load your Internet link)"
+		return 1
+	fi
+	target=$ans
+	tell <<-EOF
+
+	On $ans, start an iperf3 server and leave it running:   iperf3 -s ${PORT:+-p $PORT}
+	EOF
+	pause "Press Enter when it runs."
 }
 
 # which octeon_pip conduit carries the traffic to the PC, if any: "conduit port"
@@ -695,7 +778,12 @@ bench_forward() {
 		target=$FWD_PEER
 	else
 		ask "Does your PC have a second Ethernet port you can plug into another router port? (y/n)" n
-		case "$ans" in y*|Y*) ;; *) say "  skipped"; return ;; esac
+		case "$ans" in
+		y*|Y*) ns=1 ;;
+		*) ns=; wan_peer || { say "  skipped"; return; } ;;
+		esac
+	fi
+	if [ -z "$FWD_PEER" ] && [ -n "$ns" ]; then
 		target=$NETNS_NET.2
 		l3=$(ip route get "$PEER" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p')
 		me=$(ip route get "$PEER" 2>/dev/null | sed -n 's/.* src \([^ ]*\).*/\1/p')
@@ -907,16 +995,62 @@ summary() {
 		[ -s "$S/bootregs.txt" ] || echo "(no octeon-bootregs lines: not a test kernel, or dmesg wrapped)"
 		echo '```'
 		echo
-		echo "### Non-zero error counters"
+		# counters and warnings after the tests when there are any
+		A=$S; when="before the tests"
+		[ -d "$OUT/after" ] && { A=$OUT/after; when="totals since boot, read after the tests"; }
+		if [ -s "$A/driver.txt" ] && [ "$A" != "$S" ]; then
+			echo "### Driver state $when"
+			echo '```'
+			grep -hE 'pko error|packet buffers|output buffers|inflight|pko words| pcs ' "$A/driver.txt" | grep -v '^###' | head -40
+			echo '```'
+			echo
+		fi
+		echo "### Non-zero error counters ($when)"
 		echo '```'
-		grep -hiE '^ +[a-z0-9_-]*(err|drop|fifo|over|crc|fcs|framecheck|jabber|align|nxa|no_|fail|timeout|lost|symbol|undersize|fragment)[a-z0-9_-]*: [1-9]' "$S"/ethtool-*.txt 2>/dev/null | head -30
+		# every counter line (ethtool -S, the --all-groups eth-mac/eth-ctrl
+		# names, the stat_ lines of the interface statistics), port: name: value
+		err='[a-z0-9_-]*(err|fifo|over|crc|fcs|framecheck|frame_check|jabber|align|nxa|no_|fail|timeout|lost|symbol|undersize|oversize|fragment|missed|carrier|collision)[a-z0-9_-]*'
+		for f in "$A"/ethtool-*.txt; do
+			[ -f "$f" ] || continue
+			p=${f##*/ethtool-}; p=${p%.txt}
+			grep -iE "^ *$err: [1-9]" "$f" | grep -viE 'dropped|ok:|errors_ok' | sed "s/^ */$p: /"
+		done | sort -u | head -40 | with_before
 		echo '```'
 		echo
-		echo "### Kernel warnings"
+		echo "### Drops ($when; not errors by themselves: rx_dropped counts frames no protocol took)"
 		echo '```'
-		grep -iE 'warn|error|fail|oops|(^|[^a-z])bug([^a-z]|$)|call trace|timeout|stopped' "$S/dmesg.txt" | grep -v octeon-bootregs | head -30
+		for f in "$A"/ethtool-*.txt; do
+			[ -f "$f" ] || continue
+			p=${f##*/ethtool-}; p=${p%.txt}
+			grep -iE '^ *[a-z0-9_-]*dropped[a-z0-9_-]*: [1-9]' "$f" | sed "s/^ */$p: /"
+		done | sort -u | head -20 | with_before
+		echo '```'
+		echo
+		echo "### PAUSE frames ($when)"
+		echo '```'
+		for f in "$A"/ethtool-*.txt; do
+			[ -f "$f" ] || continue
+			p=${f##*/ethtool-}; p=${p%.txt}
+			grep -iE '^ *[a-z0-9_-]*(MACControlFrames(Transmitted|Received)|ctl_frames|pause[a-z_]*frames)[a-z0-9_-]*: [1-9]' "$f" | sed "s/^ */$p: /"
+		done | sort -u | head -20 | with_before
+		echo '```'
+		echo
+		echo "### Kernel warnings (dmesg ${when#totals since boot, })"
+		echo '```'
+		grep -iE 'warn|error|fail|oops|(^|[^a-z])bug([^a-z]|$)|call trace|timeout|stopped' "$A/dmesg.txt" | grep -v octeon-bootregs | head -30
 		echo '```'
 	} > "$M"
+}
+
+# "port: name: value" lines read from $A: add the value of the snapshot
+# before the tests ($S) when $A is the one after them
+with_before() {
+	while IFS= read -r l; do
+		[ "$A" = "$S" ] && { echo "$l"; continue; }
+		p=${l%%: *}; r=${l#*: }; n=${r%%: *}
+		b=$(grep -m1 "^ *$n: " "$S/ethtool-$p.txt" 2>/dev/null | sed 's/.*: //')
+		echo "$l (before the tests: ${b:-?})"
+	done
 }
 
 pack() {
@@ -928,7 +1062,10 @@ pack() {
 	bench*.md/txt  benchmark results; fwd-*.md and fwd/ the forwarding test
 	               (softnet_stat, tc qdisc, PIP queue samples, conntrack offload)
 	snapshot/      system, dmesg, logread, network, ethtool per port, pinning,
-	               firewall, driver debugfs, registers, device tree
+	               firewall, driver debugfs, device tree, taken before the tests;
+	               regs.txt in it is read again after the tests
+	after/         driver debugfs, ethtool counters per port, dmesg, softnet
+	               and interrupts again, after the tests
 	../boot/       the same snapshot taken right after boot
 	Masked: MAC addresses past their OUI, public IPv4 and global IPv6
 	addresses, DHCP log lines, uci keys/passwords/usernames, SFP serials, the
@@ -1034,6 +1171,7 @@ fi
 
 hdr "Report"
 regs_now "$OUT/snapshot"	# again, after the tests
+after "$OUT/after"
 summary
 pack
 cat "$OUT/summary.md"

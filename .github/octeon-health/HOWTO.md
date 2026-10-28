@@ -152,14 +152,17 @@ It asks a few questions and tells you what to do on the PC:
    restores the register afterwards, also when you press Ctrl-C. If the new
    setting breaks the link, it can drop for a few seconds; the test notices
    that and restores the old value. `NOAB=1` turns this test off.
-4. **Forwarding test (optional, Linux PC with a second Ethernet port):** answer
-   `y`, plug the second port into another LAN port, and run the printed
+4. **Forwarding test (optional):** with a second Ethernet port on a Linux PC,
+   answer `y`, plug the second port into another LAN port, and run the printed
    commands (a network namespace with that port, about 7 commands, needs sudo).
    Then start the printed `iperf3 -c` command four times as it asks and press
    Enter right after (within about 10 s). The measurement starts when the
    router sees the traffic (it waits up to 30 s after Enter); if the client
    ended before the measurement did, the row says so. Each run takes about
-   50 s. Answer `n` to skip.
+   50 s. Without a second port, answer `n`: the script then offers to forward
+   to an iperf3 server behind the WAN port (a private address, or a host
+   directly on the WAN network, not one on the internet). Answer `n` again to
+   skip.
 5. **The report:** it prints `summary.md` and the `scp` line for the archive.
 
 Get the archive from the PC (the `-O` matters, the router has no SFTP):
@@ -174,8 +177,9 @@ Then post a comment in the PR with the archive attached and `summary.md` pasted
 in. Say which router it is and, if you know it, which U-Boot version.
 
 **What the archive contains** (it lists this in `CONTENTS.txt` too): the
-summary, the run's output, the benchmark and forwarding results, and two
-snapshots (after boot and at the start of the run) with system and kernel
+summary, the run's output, the benchmark and forwarding results, two
+snapshots (after boot and at the start of the run) and a short one after the
+tests (driver state, `dmesg`, counters), with system and kernel
 info, `dmesg`, `logread`, network configuration and counters, `ethtool` output
 per port, interrupts and pinning, the firewall's flowtables, the driver's
 debugfs, the OCTEON registers and the device tree. Before it is packed, MAC

@@ -1,8 +1,9 @@
 From: Simon Polack <spolack+git@mailbox.org>
 Subject: [PATCH] MIPS: Octeon: log the bootloader's packet I/O registers (test images only)
 
-Not for upstream: test images log the GMX, PCS, PIP, IPD and PKO
-registers before any driver probes, for remote debugging.
+Not for upstream: test images log the GMX (with the TX backpressure
+override), PCS, PIP, IPD and PKO registers before any driver probes, for
+remote debugging.
 
 Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 ---
@@ -18,7 +19,7 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
  obj-$(CONFIG_MTD)		      += flash_setup.o
 --- a/arch/mips/cavium-octeon/octeon-bootregs.c	1970-01-01 01:00:00.000000000 +0100
 +++ b/arch/mips/cavium-octeon/octeon-bootregs.c	1970-01-01 01:00:00.000000000 +0100
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,127 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Test images only: log the packet I/O registers as the bootloader left
@@ -98,6 +99,7 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 +		case CVMX_HELPER_INTERFACE_MODE_SGMII:
 +		case CVMX_HELPER_INTERFACE_MODE_PICMG:
 +			bootreg("GMX_INF_MODE", i, -1, CVMX_GMXX_INF_MODE(i));
++			bootreg("GMX_TX_OVR_BP", i, -1, CVMX_GMXX_TX_OVR_BP(i));
 +			for (x = 0; x < 4; x++) {
 +				bootregs_gmx_port(i, x);
 +				bootregs_pcs_port(i, x);
@@ -106,6 +108,7 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 +		case CVMX_HELPER_INTERFACE_MODE_RGMII:
 +		case CVMX_HELPER_INTERFACE_MODE_GMII:
 +			bootreg("GMX_INF_MODE", i, -1, CVMX_GMXX_INF_MODE(i));
++			bootreg("GMX_TX_OVR_BP", i, -1, CVMX_GMXX_TX_OVR_BP(i));
 +			for (x = 0; x < (OCTEON_IS_MODEL(OCTEON_CN50XX) ? 3 : 4);
 +			     x++)
 +				bootregs_gmx_port(i, x);
@@ -118,6 +121,7 @@ Signed-off-by: Simon Polack <spolack+git@mailbox.org>
 +			break;
 +		case CVMX_HELPER_INTERFACE_MODE_XAUI:
 +			bootreg("GMX_INF_MODE", i, -1, CVMX_GMXX_INF_MODE(i));
++			bootreg("GMX_TX_OVR_BP", i, -1, CVMX_GMXX_TX_OVR_BP(i));
 +			bootregs_gmx_port(i, 0);
 +			bootreg("PCSX_CONTROL1", i, -1,
 +				CVMX_PCSXX_CONTROL1_REG(i));
