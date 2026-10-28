@@ -1,0 +1,539 @@
+#!/bin/sh
+# octeon-itus-debug: why an SGMII/QSGMII port of octeon_pip passes no traffic.
+# Written for the Itus Shield (CN7020, QSGMII to a Marvell 88E1545, PHY
+# interrupt on GPIO 7); runs on any OCTEON II/III board with octeon_pip, the
+# Marvell pages only on Marvell PHYs.
+#
+#   octeon-itus-debug          collect (read-only, ports brought up), a verdict per port
+#   octeon-itus-debug kick     + an autonegotiation restart per port (ethtool -r), collect
+#   octeon-itus-debug full     + kick, then on one linked port a PCS power cycle and on
+#                              another the Marvell SGMII autonegotiation bypass off, then
+#                              both on every port, then a forced PHY interrupt; a
+#                              collection after each step. The bypass setting stays
+#                              until the next reboot: run "full" right after a boot.
+#
+# Plug the cables in, far end powered, before booting; run it on the serial
+# console (the network may be dead). Everything lands in
+# /tmp/octeon-itus-debug/<stamp>/ and in one .tar.gz next to it (MACs past
+# the OUI and public addresses masked); summary.md is the part to paste.
+#
+# Raw MDIO goes through the OCTEON SMI registers with devmem, beside the
+# kernel's MDIO driver: page switches are batched, refused while the page
+# register is not 0 (the kernel mid-access), and every register is read
+# twice. Marvell page 4 holds per-port copies except 26_4/27_4 (common).
+# The first and the last collection dump every documented PCS and GMX
+# register of each port (not the read-to-clear statistics, not the MAC
+# address CAM) and Marvell pages 0-7 and 18 in full (not 13/14/22; the
+# interrupt status 19_0/19_1/19_4 is read once, last, as it clears). Other
+# Marvell reads with side effects, harmless here: 10_0 (idle error count,
+# bit 15 latching), 21_0/21_1/21_4 (receive error counters: errors since the
+# last read), 24_1/24_4 (freeze 25_1/25_4), 26_6.6 (temperature, latching).
+
+BASE=/tmp/octeon-itus-debug
+WIN=${WIN:-}				# seconds of each counter window (10, full: 5)
+SMI=0x1180000001800			# SMI0: CMD +0, WR_DAT +8, RD_DAT +0x10
+PCS=0x11800B0001000			# PCS of interface 0, port i at +i*0x400
+GMX=0x1180008000000			# GMX0, port i at +i*0x800
+GMX_INF_MODE=0x11800080007F8
+GPIO_RX_DAT=0x1070000000880
+GPIO_PIN=${GPIO_PIN:-7}			# the PHYs' INTn on the Itus Shield
+VERSION=2
+
+have() { command -v "$1" > /dev/null 2>&1; }
+hex() { case "$1" in ''|'?') echo '?' ;; *) printf '0x%x' "$1" ;; esac; }
+rd64() { devmem "$1" 64 2>/dev/null || echo "?"; }
+say() { echo "$*"; echo "$*" >> "$OUT/run.log"; }
+cap() { f=$1; shift; { echo "### $*"; sh -c "$*" 2>&1; echo; } >> "$f"; }
+msleep() { sleep "$(awk -v m="$1" 'BEGIN { printf "%.3f", m / 1000 }')" 2>/dev/null || sleep 1; }
+num() { case "$1" in ''|'?'|ERR) return 1 ;; esac; return 0; }
+
+# mask FILE...: what a public report must not show: the MACs past their OUI
+# (also inside EUI-64 IPv6 addresses), public IPv4 and global IPv6 addresses, SFP serial numbers
+mask() {
+	for f in "$@"; do
+		[ -f "$f" ] || continue
+		awk '
+		function priv(a,  o) { split(a, o, ".")
+			return o[1] == 10 || o[1] == 127 || o[1] == 0 || o[1] >= 224 ||
+				(o[1] == 192 && o[2] == 168) || (o[1] == 172 && o[2] >= 16 && o[2] <= 31) ||
+				(o[1] == 169 && o[2] == 254) || (o[1] == 100 && o[2] >= 64 && o[2] <= 127) }
+		# an address, not a version: octets up to 255, not part of a longer
+		# dotted number, not after "version"/"ver"/"v"
+		function ip4(a, before, after,  o) { split(a, o, ".")
+			if (o[1] > 255 || o[2] > 255 || o[3] > 255 || o[4] > 255) return 0
+			if (before ~ /[0-9.]$/ || after ~ /^(\.?[0-9])/) return 0
+			return before !~ /([Vv]ersion|[Vv]er|[^a-zA-Z][vV])[:= ]*$/ }
+		# the character before the match: from what is already done when the
+		# match is at the start of the rest (substr(s, 0, 1) is not "")
+		function prev(s, o) { return RSTART > 1 ? substr(s, 1, RSTART - 1) : o }
+		{ s = $0; o = ""
+		  while (match(s, /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/)) {
+			a = substr(s, RSTART, RLENGTH); b = prev(s, o)
+			if (ip4(a, b, substr(s, RSTART + RLENGTH, 2)) && !priv(a)) a = "x.x.x.x"
+			o = o substr(s, 1, RSTART - 1) a; s = substr(s, RSTART + RLENGTH) }
+		  s = o s; o = ""
+		  # global unicast IPv6 (2000::/3): "::" or at least 4 colons, not a time
+		  while (match(s, /[23][0-9a-fA-F]?[0-9a-fA-F]?[0-9a-fA-F]?:[0-9a-fA-F:]*[0-9a-fA-F:]/)) {
+			a = substr(s, RSTART, RLENGTH); n = gsub(/:/, ":", a)
+			b = prev(s, o); pre = substr(b, length(b), 1)
+			mac = a ~ /^[0-9a-fA-F][0-9a-fA-F](:[0-9a-fA-F][0-9a-fA-F])+$/
+			if ((index(a, "::") || n >= 4) && pre !~ /[0-9a-zA-Z]/ && !mac) a = "2xxx:(masked)"
+			o = o substr(s, 1, RSTART - 1) a; s = substr(s, RSTART + RLENGTH) }
+		  print o s }' "$f" |
+		sed -E -e 's/(([0-9a-fA-F]{2}:){3})([0-9a-fA-F]{2}:){2}[0-9a-fA-F]{2}/\1xx:xx:xx/g' \
+			-e 's/([0-9a-fA-F]{2})ff:fe[0-9a-fA-F]{1,2}:[0-9a-fA-F]{1,4}/\1ff:fexx:xxxx/g' \
+			-e 's/(Vendor SN[^:]*:).*/\1 (masked)/' \
+			-e 's/( sn +)[^ ]+( +dc )/\1(masked)\2/' > "$f.m" && mv "$f.m" "$f"
+	done
+}
+
+# ------------------------------------------------------------ raw MDIO
+
+# wait for no read and no write pending on SMI0
+smi_idle() {
+	i=0
+	while [ $i -lt 100 ]; do
+		r=$(devmem $((SMI + 0x10)) 64 2>/dev/null) || return 1
+		w=$(devmem $((SMI + 8)) 64 2>/dev/null) || return 1
+		[ $(( ((r | w) >> 17) & 1 )) = 0 ] && return 0
+		i=$((i + 1))
+	done
+	return 1
+}
+# mr PHY REG: clause 22 read, "0x%04x" or ERR
+mr() {
+	smi_idle || { echo ERR; return; }
+	devmem $SMI 64 $(( (1 << 16) | ($1 << 8) | $2 )) > /dev/null 2>&1 || { echo ERR; return; }
+	i=0
+	while [ $i -lt 100 ]; do
+		v=$(devmem $((SMI + 0x10)) 64 2>/dev/null) || break
+		[ $(( (v >> 16) & 3 )) = 1 ] && { printf '0x%04x\n' $(( v & 0xffff )); return; }
+		i=$((i + 1))
+	done
+	echo ERR
+}
+# mw PHY REG VAL: clause 22 write
+mw() {
+	smi_idle || return 1
+	devmem $((SMI + 8)) 64 $(( $3 )) > /dev/null 2>&1
+	devmem $SMI 64 $(( ($1 << 8) | $2 )) > /dev/null 2>&1
+	i=0
+	while [ $i -lt 100 ]; do
+		v=$(devmem $((SMI + 8)) 64 2>/dev/null) || return 1
+		[ $(( (v >> 17) & 1 )) = 0 ] && return 0
+		i=$((i + 1))
+	done
+	return 1
+}
+# page_enter PHY PAGE: switch the Marvell page (register 22) from 0, only when
+# it is 0 (else the kernel is mid-access: retried, then refused)
+page_enter() {
+	n=0
+	while :; do
+		cur=$(mr "$1" 22)
+		[ "$cur" = ERR ] && return 1
+		[ $(( cur & 0xff )) = 0 ] && break
+		n=$((n + 1)); [ $n -ge 5 ] && return 1
+		msleep 30
+	done
+	[ "$2" = 0 ] || mw "$1" 22 "$2"
+}
+page_leave() { mw "$1" 22 0; }
+# mpage PHY PAGE REG...: "phy page P reg R first second" lines, one page switch
+mpage() {
+	p=$1 pg=$2; shift 2
+	if ! page_enter "$p" "$pg"; then
+		for r in "$@"; do echo "phy page $pg reg $r ERR ERR"; done; return
+	fi
+	for r in "$@"; do
+		if [ -n "$MPAGE_ONCE" ]; then echo "phy page $pg reg $r $(mr "$p" "$r")"
+		else echo "phy page $pg reg $r $(mr "$p" "$r") $(mr "$p" "$r")"; fi
+	done
+	page_leave "$p"
+}
+# mwp PHY PAGE REG VAL
+mwp() { page_enter "$1" "$2" || return 1; mw "$1" "$3" "$4"; page_leave "$1"; }
+bit() { num "$1" || { echo "?"; return; }; echo $(( ($1 >> $2) & 1 )); }
+
+# ------------------------------------------------------------ the ports
+
+# the octeon_pip ports with a device tree node (not the loopback ports)
+opip_devs() {
+	for d in /sys/class/net/*; do
+		drv=$(readlink "$d/device/driver" 2>/dev/null)
+		[ "${drv##*/}" = octeon_pip ] && [ -e "$d/of_node" ] && echo "${d##*/}"
+	done
+}
+# be32 FILE: a big-endian 32-bit cell
+be32() { h=$(hexdump -v -n 4 -e '/1 "%02x"' "$1" 2>/dev/null); [ -n "$h" ] && echo $((0x$h)); }
+# port DEV: iface, index from the DT node; phy (MDIO address), phynode, pn (phylib name)
+port() {
+	iface=? index=? phy= phynode= pn=
+	pn=$(readlink -f "/sys/class/net/$1/phydev" 2>/dev/null); pn=${pn##*/}
+	node=$(readlink -f "/sys/class/net/$1/of_node" 2>/dev/null)
+	case "$node" in
+	*interface@*/ethernet@*)
+		iface=${node##*interface@}; iface=${iface%%/*}
+		index=${node##*ethernet@}; index=${index%%/*} ;;
+	esac
+	[ -r "$node/phy-handle" ] || return
+	ph=$(be32 "$node/phy-handle"); [ -n "$ph" ] || return
+	for f in $(find /proc/device-tree/ -name phandle 2>/dev/null); do
+		[ "$(be32 "$f")" = "$ph" ] || continue
+		phynode=${f%/phandle}
+		phy=$(be32 "$phynode/reg")
+		break
+	done
+}
+pcsr() { hex $((PCS + $1 * 0x400 + $2)); }
+# irq_of DEV: the PHY's irq number (the action name in /proc/interrupts is
+# the phylib device name), POLL, or ?
+irq_of() {
+	pn=$(readlink -f "/sys/class/net/$1/phydev" 2>/dev/null); pn=${pn##*/}
+	[ -n "$pn" ] || { echo "?"; return; }
+	n=$(awk -v p="$pn" 'index($0, p) { sub(":", "", $1); print $1; exit }' /proc/interrupts)
+	[ -n "$n" ] && { echo "$n"; return; }
+	if dmesg | grep -q "\[$pn\].*irq=POLL"; then echo POLL; else echo "?"; fi
+}
+irq_count() {
+	case "$1" in POLL|'?') echo -; return ;; esac
+	awk -v n="$1:" '$1 == n { s = 0; for (i = 2; i <= NF && $i ~ /^[0-9]+$/; i++) s += $i; print s }' /proc/interrupts
+}
+gpio_level() { v=$(rd64 $GPIO_RX_DAT); num "$v" && echo $(( (v >> GPIO_PIN) & 1 )) || echo "?"; }
+pingall() {	# DEV: IPv6 all-nodes on the link, answered by the far end without addressing
+	if [ -n "$PING6" ]; then $PING6 -c 3 -w 4 -I "$1" ff02::1 2>&1 | tail -3; else echo "no IPv6 ping"; fi
+}
+
+# ------------------------------------------------------------ full dumps
+
+# the documented PCS registers of a port (CN70XX, cvmx-pcsx-defs.h)
+PCS_REGS="000 008 010 018 020 028 040 048 050 058 060 068 070 078 080 088 090"
+# the documented GMX per-port registers, without the read-to-clear statistics
+# (0x080-0x0c0, 0x280-0x2c8: the driver's) and the address CAM/SMAC (MACs)
+GMX_PORT_REGS="000 008 010 018 020 038 040 048 050 058 060 068 100 108 110 210 218 220 228 238 240 248 250 258 260 268 270 300"
+GMX_IFACE_REGS="400 410 420 428 430 438 440 448 450 458 460 468 470 478 480 488 490 498 4a0 4a8 4c8 4d0 4d8 4e8 4f8 500 508 510 518 520 528 530 538 540 548 550 558 560 580 5a0 5c0 740 760 7e0 7f0 7f8"
+# the Marvell registers not read in a dump: 13/14 (MMD window: a read of 14
+# can advance the kernel's MMD address), 22 (the page register), and the
+# interrupt status 19 on pages 0, 1, 4 (a read clears a pending interrupt and
+# can release INTn; read once at the very end, see intstatus)
+phy_regs() {
+	r=0; out=
+	while [ $r -lt 32 ]; do
+		case "$r" in 13|14|22) ;; 19) case "$1" in 0|1|4) ;; *) out="$out $r" ;; esac ;; *) out="$out $r" ;; esac
+		r=$((r + 1))
+	done
+	echo $out
+}
+# full DEV FILE: every documented OCTEON register of the port and, on a
+# Marvell PHY, pages 0-7 and 18 (two reads each, one page switch per page)
+full() {
+	port "$1"
+	{
+	echo "# $1 iface $iface index $index phy ${phy:--}"
+	if [ "$iface" = 0 ] && [ "$index" != "?" ]; then
+		for o in $PCS_REGS; do echo "pcs +0x$o $(hex "$(rd64 "$(pcsr "$index" 0x$o)")")"; done
+		for o in $GMX_PORT_REGS; do echo "gmx port +0x$o $(hex "$(rd64 "$(hex $((GMX + index * 0x800 + 0x$o)))")")"; done
+	fi
+	if [ -n "$phy" ]; then
+		if [ "$(mr "$phy" 2)" = 0x0141 ]; then
+			for pg in 0 1 2 3 4 5 6 7 18; do MPAGE_ONCE=1 mpage "$phy" $pg $(phy_regs $pg); done
+		else
+			r=0; while [ $r -lt 32 ]; do case "$r" in 13|14|22) ;; *) echo "phy c22 reg $r $(mr "$phy" $r)" ;; esac; r=$((r + 1)); done
+		fi
+	fi
+	} > "$2" 2>&1
+}
+gmx_iface() {
+	for o in $GMX_IFACE_REGS; do echo "gmx0 +0x$o $(hex "$(rd64 "$(hex $((GMX + 0x$o)))")")"; done
+	i=0; while [ $i -lt 16 ]; do echo "GPIO_BIT_CFG$i $(hex "$(rd64 "$(hex $((0x1070000000800 + i * 8)))")")"; i=$((i + 1)); done
+	echo "GPIO_RX_DAT $(hex "$(rd64 $GPIO_RX_DAT)")"
+}
+# the PHYs' interrupt status registers (19 on pages 0, 1, 4): the last
+# action of a run, as a read clears them
+intstatus() {
+	for d in $DEVS; do
+		port "$d"; [ -n "$phy" ] || continue
+		[ "$(mr "$phy" 2)" = 0x0141 ] || continue
+		echo "$d PHY $phy: GPIO $GPIO_PIN level $(gpio_level) before; $(mpage "$phy" 0 19 | cut -d' ' -f3-) | $(mpage "$phy" 1 19 | cut -d' ' -f3-) | $(mpage "$phy" 4 19 | cut -d' ' -f3-); GPIO $GPIO_PIN level $(gpio_level) after"
+	done
+}
+
+# ------------------------------------------------------------ collection
+
+static_info() {
+	S=$OUT/static.txt
+	cap "$S" "uname -a; cat /etc/openwrt_release 2>/dev/null"
+	cap "$S" "cat /tmp/sysinfo/board_name /tmp/sysinfo/model 2>/dev/null; cat /proc/device-tree/model 2>/dev/null; echo"
+	cap "$S" "grep -m1 -i 'system type' /proc/cpuinfo; grep -c ^processor /proc/cpuinfo"
+	cap "$S" "cat /proc/cmdline; uptime; cat /proc/uptime"
+	dmesg > "$OUT/dmesg.txt" 2>&1
+	logread 2>&1 | grep -vE 'dnsmasq-dhcp|odhcpd|DHCP(ACK|OFFER|REQUEST|DISCOVER)' > "$OUT/logread.txt"
+	grep 'octeon-bootregs:' "$OUT/dmesg.txt" | sed 's/.*octeon-bootregs: //' > "$OUT/bootregs.txt"
+	cap "$S" "grep -E 'Device Tree|Built-in DTB|board type|Interface [0-9] has|octeon_pip|phylink|link mode|PHY \\[|mdio|Link is|irq=|qsgmii|sgmii|in-band|inband|WARN|pcs|nobody cared|Disabling IRQ|irq [0-9]+:|gpio' $OUT/dmesg.txt"
+	cap "$S" "lsmod 2>/dev/null | grep -E 'octeon|marvell|phy|mdio|gpio'"
+	cap "$S" "for d in /sys/class/net/*; do echo \$d \$(readlink -f \$d/of_node 2>/dev/null) \$(readlink \$d/device/driver 2>/dev/null) phydev=\$(readlink -f \$d/phydev 2>/dev/null) flags=\$(cat \$d/flags); done"
+	cap "$S" "echo GMX_INF_MODE(0) \$(devmem $GMX_INF_MODE 64)"
+	cap "$S" "echo GPIO_BIT_CFG$GPIO_PIN \$(devmem $(hex $((0x1070000000800 + GPIO_PIN * 8))) 64) '(bit0 tx_oe, 1 rx_xor, 2 int_en, 3 int_type 1=edge, 7:4 fil_cnt, 11:8 fil_sel)'"
+	cap "$S" "cat /proc/interrupts"
+	cap "$S" "ls /sys/kernel/debug/gpio 2>/dev/null && cat /sys/kernel/debug/gpio"
+	# the irq of each PHY, as the kernel set it up
+	for d in $DEVS; do
+		n=$(irq_of "$d")
+		case "$n" in POLL|'?') echo "$d: phy irq $n" >> "$S" ;;
+		*) cap "$S" "echo $d irq $n; for a in chip_name hwirq type actions per_cpu_count name wakeup; do echo \$a=\$(cat /sys/kernel/irq/$n/\$a 2>/dev/null); done" ;;
+		esac
+	done
+	# the device tree of the packet ports, the PHYs and the GPIO controller
+	D=$OUT/devicetree.txt
+	for n in $(find /proc/device-tree/ -path '*pip*' -type d 2>/dev/null) \
+		 $(find /proc/device-tree/ -name 'ethernet-phy@*' -type d 2>/dev/null) \
+		 $(find /proc/device-tree/ \( -name 'mdio@*' -o -name 'gpio-controller@*' -o -name 'gpio@*' \) -type d 2>/dev/null); do
+		echo "## $n" >> "$D"
+		for p in "$n"/*; do
+			[ -f "$p" ] || continue
+			case "${p##*/}" in *mac-address*) continue ;; esac
+			printf '%s: %s | %s\n' "${p##*/}" "$(tr '\000' ' ' < "$p" | head -c 120)" \
+				"$(hexdump -v -n 64 -e '/1 "%02x "' "$p" 2>/dev/null)" >> "$D"
+		done
+	done
+}
+
+# collect TAG: everything that changes, per port, into $OUT/TAG/; a verdict
+collect() {
+	tag=$1; C=$OUT/$tag; mkdir -p "$C"
+	cat /proc/interrupts > "$C/interrupts-0.txt"
+	for d in $DEVS; do
+		echo "$(cat /sys/class/net/$d/statistics/rx_packets) $(cat /sys/class/net/$d/statistics/tx_packets)" > "$C/cnt0-$d"
+		irq_count "$(irq_of "$d")" > "$C/irq0-$d"
+		ethtool -S "$d" --all-groups > "$C/stats0-$d" 2>&1
+	done
+	g0=$(gpio_level)
+	for d in $DEVS; do pingall "$d" > "$C/ping-$d.txt" 2>&1 & done
+	sleep "$WIN"; wait
+	g1=$(gpio_level)
+	cat /proc/interrupts > "$C/interrupts-1.txt"
+	echo "GPIO $GPIO_PIN level $g0 -> $g1 (INTn is active low); GPIO_RX_DAT $(hex "$(rd64 $GPIO_RX_DAT)")" > "$C/gpio.txt"
+	cat /sys/kernel/debug/octeon_pip/*/status > "$C/status.txt" 2>&1
+	for d in $DEVS; do
+		port "$d"; f=$C/port-$d.txt
+		{
+		echo "dev $d iface $iface index $index phy ${phy:--} phynode ${phynode:--} phydev ${pn:--}"
+		echo "carrier $(cat /sys/class/net/$d/carrier 2>/dev/null || echo down) operstate $(cat /sys/class/net/$d/operstate) flags $(cat /sys/class/net/$d/flags) carrier_changes $(cat /sys/class/net/$d/carrier_changes)"
+		set -- $(cat "$C/cnt0-$d")
+		echo "rx_packets +$(( $(cat /sys/class/net/$d/statistics/rx_packets) - $1 )) tx_packets +$(( $(cat /sys/class/net/$d/statistics/tx_packets) - $2 )) in ${WIN}s"
+		echo "ping_all_nodes $(grep -o '[0-9]* packets received' "$C/ping-$d.txt" | head -1)"
+		irq=$(irq_of "$d"); echo "phy_irq $irq count $(cat "$C/irq0-$d") -> $(irq_count "$irq")"
+		ethtool "$d" 2>&1 | grep -E 'Speed|Duplex|Auto-negotiation|Link detected|Port:'
+		echo "ethtool -S changes in the window:"
+		ethtool -S "$d" --all-groups 2>&1 | awk 'NR == FNR { a[$1] = $2; next } ($1 in a) && $2 != a[$1] { print "  " $1, a[$1], "->", $2 }' "$C/stats0-$d" -
+		if [ "$iface" = 0 ] && [ "$index" != "?" ]; then
+			for r in MR_CONTROL:0x000 MR_STATUS:0x008 AN_ADV:0x010 AN_LP_ABIL:0x018 AN_RESULTS:0x020 \
+				 LINK_TIMER:0x040 RX_SYNC:0x050 RX_STATES:0x058 SGM_AN_ADV:0x068 SGM_LP_ADV:0x070 \
+				 MISC_CTL:0x078 INT_REG:0x080 INT_EN:0x088; do
+				echo "pcs ${r%%:*} $(hex "$(rd64 "$(pcsr "$index" "${r#*:}")")")"
+			done
+			echo "pcs MR_STATUS(again) $(hex "$(rd64 "$(pcsr "$index" 0x008)")")"
+			echo "gmx PRT_CFG $(hex "$(rd64 "$(hex $((GMX + index * 0x800 + 0x10)))")") RX_INT_REG $(hex "$(rd64 "$(hex $((GMX + index * 0x800)))")") RX_INBND $(hex "$(rd64 "$(hex $((GMX + index * 0x800 + 0x60)))")")"
+		fi
+		if [ -n "$phy" ]; then
+			id1=$(mr "$phy" 2); id2=$(mr "$phy" 3)
+			echo "phy id $id1 $id2"
+			for r in 0 1 1 4 5 9 10 15; do echo "phy c22 reg $r $(mr "$phy" $r)"; done
+			if [ "$id1" = 0x0141 ]; then
+				mpage "$phy" 0 16 17 18 20 21 23
+				mpage "$phy" 1 0 1
+				mpage "$phy" 2 16 21
+				mpage "$phy" 3 16 17 18
+				mpage "$phy" 4 0 1 4 5 6 16 17 18 21 26 27
+				mpage "$phy" 18 20
+			fi
+		fi
+		} > "$f" 2>&1
+	done
+	case "$tag" in 1-*|4-*)
+		gmx_iface > "$C/octeon-iface.txt" 2>&1
+		for d in $DEVS; do full "$d" "$C/full-$d.txt"; done ;;
+	esac
+	verdict "$tag"
+}
+
+# the reading of one collection, per port, into summary.md
+verdict() {
+	vt=$1; C=$OUT/$vt
+	{ echo ""; echo "### $vt"; cat "$C/gpio.txt"; } >> "$OUT/summary.md"
+	gpio=$(sed -n 's/.*level [0-9?]* -> \([0-9?]\).*/\1/p' "$C/gpio.txt")
+	for d in $DEVS; do
+		f=$C/port-$d.txt
+		g() { sed -n "s/^$1 //p" "$f" | head -1; }
+		carrier=$(g carrier | cut -d' ' -f1)
+		flags=$(g carrier | sed 's/.*flags \([^ ]*\).*/\1/')
+		rx=$(g rx_packets | cut -d' ' -f1)
+		pingr=$(g ping_all_nodes | cut -d' ' -f1)
+		irq=$(g phy_irq); set -- $(echo "$irq" | sed 's/count//; s/->//'); irqn=$1 ic0=$2 ic1=$3
+		ctl=$(g "pcs MR_CONTROL"); res=$(g "pcs AN_RESULTS"); st=$(g "pcs MR_STATUS(again)")
+		sync=$(g "pcs RX_SYNC"); misc=$(g "pcs MISC_CTL")
+		bmsr=$(sed -n 's/^phy c22 reg 1 //p' "$f" | tail -1)
+		s0=$(g "phy page 0 reg 17" | cut -d' ' -f2)
+		q0=$(g "phy page 4 reg 0" | cut -d' ' -f1)
+		q16=$(g "phy page 4 reg 16" | cut -d' ' -f1)
+		q17=$(g "phy page 4 reg 17" | cut -d' ' -f2)
+		inband=$(bit "$ctl" 12); ancpt=$(bit "$res" 2); pcslink=$(bit "$st" 2)
+		pcssync=$(bit "$sync" 1); gmxeno=$(bit "$misc" 11)
+		phylink=$(bit "$s0" 10); [ "$phylink" = "?" ] && phylink=$(bit "$bmsr" 2)
+		qan=$(bit "$q0" 12); qbyp=$(bit "$q16" 9); qbypst=$(bit "$q17" 9)
+		qlink=$(bit "$q17" 10); qsync=$(bit "$q17" 5)
+		k0=; case "$vt" in 1-*) ;; *) k0=$(cat "$OUT/irq-kick-$d" 2>/dev/null) ;; esac
+		v="unclear: send the whole archive"
+		if [ $(( ${flags:-0} & 1 )) = 0 ]; then
+			v="the port is down (ip link), so the PHY is suspended: bring it up and run again"
+		elif [ "$phylink" = 0 ]; then
+			v="the PHY has no copper link: cable, far end, or the PHY's copper side"
+		elif [ "$carrier" != 1 ] && num "$ic1" && [ "$ic1" = 0 ] && [ "$gpio" = 0 ]; then
+			v="PHY link up, carrier down, PHY INTn asserted (GPIO $GPIO_PIN low) but irq $irqn count 0: the GPIO interrupt is not delivered (candidate 1, GPIO/CIU side)"
+		elif [ "$inband" = 1 ] && [ "$ancpt" = 0 ] && [ "$pcssync" = 0 ]; then
+			v="PHY link up, the PCS has no code-group sync: nothing arrives from the PHY's QSGMII side (lane, PHY MAC side; PHY qsgmii sync $qsync)"
+		elif [ "$inband" = 1 ] && [ "$ancpt" = 0 ]; then
+			v="PHY link up, PCS in sync but in-band autonegotiation not complete: the PHY does not answer in band (candidate A)"
+			[ "$qbypst" = 1 ] && v="$v; the PHY came up in its AN bypass (17_4.9 = 1)"
+			[ "$qan" = 0 ] && v="$v; the PHY's QSGMII autonegotiation is off (0_4.12 = 0)"
+			[ -n "$k0" ] && num "$ic1" && [ "$k0" = "$ic1" ] && v="$v; irq $irqn did not fire across the kick either"
+		elif [ "$carrier" != 1 ] && num "$ic1"; then
+			if [ -n "$k0" ] && [ "$k0" != "$ic1" ]; then
+				v="PHY link up, PCS autonegotiation complete, carrier down although irq $irqn fired ($k0 -> $ic1): phylink/PCS side, send the archive"
+			elif [ "$ic1" = 0 ]; then
+				v="PHY link up, PCS autonegotiation complete, carrier down, irq $irqn count 0 (GPIO $GPIO_PIN high): no link event delivered since boot (candidate 1, unless the forced interrupt step shows the line works)"
+			fi
+		elif [ "$carrier" = 1 ] && [ "${rx#+}" = 0 ] && [ "${pingr:-0}" = 0 ]; then
+			v="carrier up, but nothing received and no answer to the all-nodes ping: the far end is silent, or the MAC side (GMX, see the ethtool -S changes; gmxeno $gmxeno)"
+		elif [ "$carrier" = 1 ]; then
+			v="link up and frames received"
+		fi
+		echo "- **$d** carrier $carrier flags $flags, rx $rx, ping answers ${pingr:-?}; PHY link $phylink, irq $irq; PCS in-band $inband sync $pcssync an_complete $ancpt link $pcslink gmxeno $gmxeno; PHY QSGMII an $qan bypass-allowed $qbyp came-up-via-bypass $qbypst link $qlink sync $qsync → $v" >> "$OUT/summary.md"
+	done
+}
+
+# ------------------------------------------------------------ experiments
+
+# the ports whose PHY has copper link in collection TAG
+linked() {
+	for d in $DEVS; do
+		f=$OUT/$1/port-$d.txt
+		s0=$(sed -n 's/^phy page 0 reg 17 [^ ]* //p' "$f" | head -1)
+		l=$(bit "$s0" 10); [ "$l" = "?" ] && l=$(bit "$(sed -n 's/^phy c22 reg 1 //p' "$f" | tail -1)" 2)
+		[ "$l" = 1 ] && echo "$d"
+	done
+}
+# an autonegotiation restart (nway reset: phylink restarts the PHY's AN);
+# the PHY irq counts before it into $OUT/irq-kick-*
+kick() {
+	for d in $DEVS; do irq_count "$(irq_of "$d")" > "$OUT/irq-kick-$d"; done
+	for d in $DEVS; do ethtool -r "$d" >> "$OUT/run.log" 2>&1 || say "  $d: ethtool -r failed"; done
+	sleep 6
+	for d in $DEVS; do
+		irq=$(irq_of "$d")
+		r="$d: phy irq $irq count across the kick $(cat "$OUT/irq-kick-$d") -> $(irq_count "$irq")"
+		say "  $r"; echo "- kick: $r" >> "$OUT/summary.md"
+	done
+}
+# the PCS of DEV powered down for 25 ms and up again with a new AN, as the
+# SDK and the staging driver do at every link change
+pcscycle() {
+	port "$1"; [ "$iface" = 0 ] && [ "$index" != "?" ] || return
+	a=$(pcsr "$index" 0); c=$(rd64 "$a"); num "$c" || return
+	devmem "$a" 64 $(( c | 0x800 )); msleep 25
+	c=$(rd64 "$a"); num "$c" || return
+	c=$(( c & ~0x800 )); [ $(( c & 0x1000 )) != 0 ] && c=$(( c | 0x200 ))
+	devmem "$a" 64 $c
+	say "  $1: PCS power cycle"
+}
+# Marvell: the SGMII autonegotiation bypass of DEV's PHY off (16_4.9 = 0),
+# then the QSGMII soft reset (0_4.15); until the next reboot
+nobypass() {
+	port "$1"; [ -n "$phy" ] || return
+	[ "$(mr "$phy" 2)" = 0x0141 ] || return
+	v=$(mpage "$phy" 4 16 | cut -d' ' -f6); num "$v" || { say "  $1: page 4 not readable"; return; }
+	mwp "$phy" 4 16 $(( v & ~0x200 ))
+	v=$(mpage "$phy" 4 0 | cut -d' ' -f6); num "$v" || return
+	mwp "$phy" 4 0 $(( v | 0x8000 ))
+	say "  $1: PHY $phy bypass off (16_4 $(hex "$v") -> $(mpage "$phy" 4 16 | cut -d' ' -f6)), QSGMII soft reset"
+}
+# Marvell: INTn forced asserted for 0.3 s (18_3.15) on the first PHY: the
+# GPIO level and the irq count prove the line end to end without a link event
+forceint() {
+	for d in $DEVS; do
+		port "$d"; [ -n "$phy" ] || continue
+		[ "$(mr "$phy" 2)" = 0x0141 ] || continue
+		irq=$(irq_of "$d"); v=$(mpage "$phy" 3 18 | cut -d' ' -f6); num "$v" || continue
+		c0=$(irq_count "$irq"); l0=$(gpio_level)
+		mwp "$phy" 3 18 $(( v | 0x8000 )); msleep 300; l1=$(gpio_level); c1=$(irq_count "$irq")
+		mwp "$phy" 3 18 "$v"; msleep 300; l2=$(gpio_level)
+		r="forced INT on $d (PHY $phy): GPIO $GPIO_PIN level $l0 -> $l1 (forced) -> $l2 (released), irq $irq count $c0 -> $c1"
+		num "$c0" && num "$c1" && [ $((c1 - c0)) -gt 100 ] && r="$r ($((c1 - c0)) interrupts in 0.3 s: the line is level and stayed asserted, the handler ran)"
+		say "  $r"; { echo ""; echo "### forced PHY interrupt"; echo "$r"; } >> "$OUT/summary.md"
+		dmesg | tail -20 | grep -E 'nobody cared|Disabling IRQ|irq' >> "$OUT/summary.md"
+		return
+	done
+}
+
+# ------------------------------------------------------------ main
+
+[ -n "$WIN" ] || { WIN=10; [ "$1" = full ] && WIN=5; }
+PING6=; if ping -6 -c 1 -w 1 ::1 > /dev/null 2>&1; then PING6="ping -6"; elif have ping6; then PING6=ping6; fi
+have devmem || { echo "devmem is missing: this needs the octeon-health test image"; exit 1; }
+[ -d /sys/kernel/debug/octeon_pip ] || mount -t debugfs none /sys/kernel/debug 2>/dev/null
+mkdir -p "$BASE"
+runs=$(ls -d "$BASE"/[0-9]* 2>/dev/null | wc -l)
+STAMP=$(date +%Y%m%d-%H%M%S)
+OUT=$BASE/$STAMP; mkdir -p "$OUT"
+DEVS=$(opip_devs)
+[ -n "$DEVS" ] || { echo "no octeon_pip ports"; exit 1; }
+up=$(cut -d. -f1 /proc/uptime)
+first=1-boot; { [ "$up" -gt 600 ] || [ "$runs" -gt 0 ]; } && first=1-now
+{
+	echo "# octeon-itus-debug $VERSION, $(cat /tmp/sysinfo/model 2>/dev/null || cat /proc/device-tree/model 2>/dev/null), $(uname -r), $STAMP"
+	echo "mode ${1:-collect}; uptime ${up}s; earlier runs since boot $runs; window ${WIN}s per collection"
+	for d in $DEVS; do printf '%s flags %s; ' "$d" "$(cat /sys/class/net/$d/flags)"; done; echo
+} > "$OUT/summary.md"
+DEVS_OK=
+for d in $DEVS; do
+	if [ $(( $(cat /sys/class/net/$d/flags) & 1 )) = 0 ]; then
+		ip link set dev "$d" up && say "$d was down: brought up" && DEVS_OK=1
+	fi
+done
+[ -n "$DEVS_OK" ] && { echo "ports brought up by the script, waited 8 s" >> "$OUT/summary.md"; sleep 8; }
+say "collecting (about $((WIN + 10)) s per step) into $OUT"
+static_info
+collect "$first"
+case "$1" in kick|full)
+	say "experiment: autonegotiation restart (ethtool -r) on every port"; kick; collect 2-kick ;;
+esac
+MODE=$1
+if [ "$1" = full ]; then
+	stuck=; for d in $(linked 2-kick); do [ "$(cat /sys/class/net/$d/carrier 2>/dev/null)" = 1 ] || stuck="$stuck $d"; done
+	set -- $stuck
+	A=$1 B=$2
+	if [ -z "$A" ]; then
+		echo "" >> "$OUT/summary.md"; echo "every port with copper link has carrier after the kick: the PCS/bypass split is done on all ports anyway" >> "$OUT/summary.md"
+		set -- $(linked 2-kick); A=$1 B=$2
+	fi
+	[ -n "$A" ] || A=$(echo $DEVS | cut -d' ' -f1)
+	[ -n "$B" ] || B=$A
+	say "experiment: PCS power cycle on $A, Marvell AN bypass off on $B"
+	pcscycle "$A"; nobypass "$B"; sleep 6; collect "3-pcscycle-$A-nobypass-$B"
+	say "experiment: both on every port, then an autonegotiation restart"
+	for d in $DEVS; do pcscycle "$d"; done
+	for d in $DEVS; do [ "$d" = "$B" ] || nobypass "$d"; done
+	sleep 6; kick; collect 4-all
+	say "experiment: a forced PHY interrupt"; forceint
+fi
+if [ "$1" = full ] || [ "$MODE" = full ]; then
+	say "the PHY interrupt status registers (the read clears them)"
+	intstatus > "$OUT/phy-intstatus.txt" 2>&1
+	{ echo ""; echo "### PHY interrupt status at the end (19_0, 19_1, 19_4; first and second read)"; sed 's/^/    /' "$OUT/phy-intstatus.txt"; } >> "$OUT/summary.md"
+fi
+mask "$OUT"/*.txt "$OUT"/*/*.txt "$OUT/summary.md"
+tar -C "$BASE" -czf "$BASE/octeon-itus-debug-$STAMP.tar.gz" "$STAMP" 2>/dev/null
+echo
+cat "$OUT/summary.md"
+echo
+echo "archive: $BASE/octeon-itus-debug-$STAMP.tar.gz (paste summary.md above, attach the archive)"

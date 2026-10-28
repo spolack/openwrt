@@ -240,5 +240,13 @@ benchmarks.
 - **The forwarding test says `10.99.0.2 does not answer`:** the second port
   is not in the namespace or not up; check `sudo ip -n ohc addr` on the PC.
   Clean up afterwards with `sudo ip netns del ohc; sudo ip route del 10.99.0.0/24`.
+- **No traffic on any port (link LEDs on, nothing passes, no ssh):** on the
+  serial console, right after a fresh boot with the cables plugged in, run
+  `octeon-itus-debug full` (about 5 minutes; it brings the ports up, restarts
+  the autonegotiation, power-cycles a PCS, turns a Marvell PHY's SGMII
+  autonegotiation bypass off until the next reboot, and forces one PHY
+  interrupt). Paste the summary it prints and attach
+  `/tmp/octeon-itus-debug/octeon-itus-debug-*.tar.gz`; MACs and public
+  addresses in it are masked. `octeon-itus-debug` alone only reads.
 - **The router hangs or reboots:** the serial console output is the most
   valuable thing you can send: copy everything from `Linux version` on.
